@@ -10,18 +10,31 @@ __pycache__/
 venv/
 env/
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
 
 # Editor / IDE
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 
 # Backup-Dateien
 *.save
 *.bak
+*.tmp
+*.orig
 
 # Logs
 *.log
+logs/
+
+# Lokale Daten (falls jemals CSVs/JSONs lokal liegen)
+*.local.json
+*.local.csv

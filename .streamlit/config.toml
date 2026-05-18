@@ -1,0 +1,37 @@
+# Globale Streamlit-Einstellungen.
+# Theme-Farben werden hier zentral gesetzt — du kannst sie spaeter jederzeit anpassen,
+# ohne im Python-Code suchen zu muessen.
+
+[theme]
+# Hauptfarbe (Buttons, Links, aktive Elemente)
+primaryColor = "#4F46E5"
+
+# Haupt-Hintergrund der App
+backgroundColor = "#FFFFFF"
+
+# Sekundaerer Hintergrund (Sidebar, Cards)
+secondaryBackgroundColor = "#F8F9FB"
+
+# Standard-Textfarbe
+textColor = "#1F2937"
+
+# Schriftart fuer die gesamte App
+font = "sans serif"
+
+# Optional: Basis-Theme (light oder dark)
+base = "light"
+
+
+[client]
+# In Production keine Python-Stacktraces an User zeigen.
+# Setze auf "full" wenn du selbst debuggen willst.
+showErrorDetails = "stacktrace"
+
+# "viewer" versteckt das "Manage app"-Menue fuer Besucher.
+# "developer" zeigt es (nuetzlich waehrend Entwicklung).
+toolbarMode = "viewer"
+
+
+[server]
+# Schoenere Statusmeldungen
+runOnSave = true
