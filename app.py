@@ -3,9 +3,12 @@ from datetime import date, timedelta
 
 st.set_page_config(page_title="JobMatch AI", page_icon="briefcase", layout="centered")
 
-#  Supabase 
-SUPABASE_URL = "https://ktvcbcklbgetapjakjys.supabase.co"
-SUPABASE_KEY = "sb_publishable_SqfU3Nk3VQpLbw0FaGfu9w_ejrMddr8"
+#  Supabase
+# Werte werden aus .streamlit/secrets.toml (lokal) oder den Secrets im
+# Streamlit-Cloud-Dashboard gelesen. Fallback auf die alten Werte, damit
+# die App nicht crasht, falls noch keine Secrets eingerichtet sind.
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "https://ktvcbcklbgetapjakjys.supabase.co")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 
 @st.cache_resource
 def get_sb():

@@ -1,0 +1,27 @@
+# Streamlit Secrets — niemals zu GitHub pushen!
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Backup-Dateien
+*.save
+*.bak
+
+# Logs
+*.log
