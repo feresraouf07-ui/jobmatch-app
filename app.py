@@ -1,7 +1,7 @@
 import streamlit as st
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 
-st.set_page_config(page_title="JobMatch AI", page_icon="briefcase", layout="centered")
+st.set_page_config(page_title="Jobr", page_icon="⚡", layout="centered")
 
 #  Supabase
 # Werte werden aus .streamlit/secrets.toml (lokal) oder den Secrets im
@@ -47,7 +47,7 @@ def sb_login(email, password):
         return None, msg
 
 # Profil
-def sb_save_profile(user_id, profile, xp=0, streak=0, badges=[], ref_code=""):
+def sb_save_profile(user_id, profile, xp=0, streak=0, badges=[], ref_code="", last_boost_week=None):
     sb = get_sb()
     if not sb: return
     try:
@@ -71,6 +71,8 @@ def sb_save_profile(user_id, profile, xp=0, streak=0, badges=[], ref_code=""):
             "badges": badges,
             "referral_code": ref_code,
         }
+        if last_boost_week is not None:
+            data["last_boost_week"] = last_boost_week
         sb.table("profiles").upsert(data, on_conflict="user_id").execute()
     except Exception as e:
         pass  # Stille Fehler — App läuft weiter
@@ -103,6 +105,7 @@ def sb_load_profile(user_id):
             "_streak": d.get("streak_count", 0),
             "_badges": d.get("badges") or [],
             "_ref_code": d.get("referral_code",""),
+            "_last_boost_week": d.get("last_boost_week",""),
         }
     except:
         return None
@@ -152,9 +155,24 @@ def sb_load_applications(user_id):
                 "skills": d.get("skills") or [],
                 "experience": d.get("experience",""),
                 "_db_id": d.get("id"),
+                "_boosted_at": d.get("boosted_at"),
             })
         return result
     except: return []
+
+def sb_boost_application(user_id, db_id):
+    """Markiert eine Bewerbung als 'geboostet' und merkt sich die Woche."""
+    sb = get_sb()
+    if not sb:
+        return False, "Supabase nicht verfügbar"
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        sb.table("applications").update({"boosted_at": now_iso}).eq("id", db_id).eq("user_id", user_id).execute()
+        current_week = get_iso_week_str()
+        sb.table("profiles").update({"last_boost_week": current_week}).eq("user_id", user_id).execute()
+        return True, "Boost aktiv!"
+    except Exception as e:
+        return False, str(e)
 
 def sb_update_app_status(db_id, new_status):
     sb = get_sb()
@@ -204,6 +222,45 @@ def sb_load_feed():
         return [{"user": d.get("username","Anonym"), "text": d.get("text",""), "xp": d.get("xp",0),
                  "date": (d.get("created_at","") or "")[:10]} for d in (res.data or [])]
     except: return []
+
+# === Aktivitäts-System (XP / Streak / Badge / Boost) ===
+
+def get_iso_week_str(d=None):
+    """Aktuelle ISO-Woche als String wie '2026-W20' — fuer Boost-Token-Tracking."""
+    d = d or date.today()
+    iso = d.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+def compute_activity_score(xp=0, streak=0, badges=None):
+    """Gesamtaktivität als Zahl. Wird in Arbeitgeber-Sortierung verwendet."""
+    badges = badges or []
+    return int((xp or 0) + (streak or 0) * 10 + len(badges) * 5)
+
+def is_active_user(xp=0, streak=0, badges=None):
+    """Schwelle fuer 'Verified Active' Badge + Early Access.
+    Aktiv = mind. 3 Tage Streak ODER 100+ XP ODER 1+ Badge."""
+    badges = badges or []
+    return (streak or 0) >= 3 or (xp or 0) >= 100 or len(badges) >= 1
+
+def get_user_activity():
+    """Lese aktuelle XP/Streak/Badges aus session_state."""
+    xp = st.session_state.get("xp", 0) or 0
+    streak = st.session_state.get("streak_count", 0) or 0
+    badges = st.session_state.get("badges", []) or []
+    return xp, streak, badges
+
+def user_is_active():
+    """Shortcut: ist eingeloggter User aktiv?"""
+    return is_active_user(*get_user_activity())
+
+def is_early_access_job(job):
+    """Frisch eingestellte Jobs = Early-Access-Pool fuer aktive User."""
+    return (job.get("puls","") or "").strip() in ("Neu eingestellt", "Neu · Sehr gesucht")
+
+def can_boost_this_week():
+    """Hat der User in dieser Woche schon geboostet?"""
+    last = st.session_state.get("last_boost_week", "")
+    return last != get_iso_week_str()
 
 TOTAL_STEPS_SEEKER = 11
 TOTAL_STEPS_EMPLOYER = 7
@@ -342,6 +399,7 @@ DEFAULTS = {
     "xp":0,"level_name":"Newcomer","level_color":"#6b7280","badges":[],
     "referral_code":"","referred_friends":[],
     "countdown_jobs":{},"social_feed":[],
+    "last_boost_week":"",
 }
 for k,v in DEFAULTS.items():
     if k not in st.session_state:
@@ -507,6 +565,13 @@ def calculate_matches(profile):
     if mode=="Passendste": filtered.sort(key=lambda x:x["score"],reverse=True)
     elif mode=="Neueste": filtered.sort(key=lambda x:x["recency"],reverse=True)
     elif mode=="Dringend": filtered.sort(key=lambda x:x["urgency"],reverse=True)
+    # Early Access: Frisch eingestellte Jobs sind nur fuer aktive User sichtbar
+    if not user_is_active():
+        locked = [j for j in filtered if is_early_access_job(j)]
+        filtered = [j for j in filtered if not is_early_access_job(j)]
+        st.session_state.early_access_locked_count = len(locked)
+    else:
+        st.session_state.early_access_locked_count = 0
     return filtered
 
 def find_similar_jobs(job, all_matches, n=2):
@@ -720,41 +785,230 @@ def lbl(text):
 def val(text, size=14, color="#e0e0e0"):
     st.markdown(f"<p style='font-size:{size}px;color:{color};font-family:Inter,sans-serif;margin:0 0 4px 0;line-height:1.55;'>{text}</p>",unsafe_allow_html=True)
 
-#  CSS 
+#  CSS - Jobr Theme (Modern/Tech: Anthrazit + Cyan)
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-html,body,[data-testid="stAppViewContainer"],[data-testid="stApp"]{background:#000!important;color:#fff!important;font-family:'Inter',sans-serif!important;}
-[data-testid="stHeader"]{background:transparent!important;}
-[data-testid="stToolbar"]{display:none!important;}
-.block-container{padding-top:2rem!important;max-width:640px!important;}
-.stTextInput>div>div>input,.stTextArea>div>textarea{background:#111!important;border:1px solid #333!important;border-radius:8px!important;color:#ffffff!important;font-family:'Inter',sans-serif!important;font-size:15px!important;font-weight:500!important;}
-.stTextInput>div>div>input::placeholder,.stTextArea>div>textarea::placeholder{color:#555!important;}
-.stTextInput>div>div>input:focus,.stTextArea>div>textarea:focus{border-color:#fff!important;box-shadow:none!important;}
-.stTextInput label,.stTextArea label,.stSelectbox label,.stMultiSelect label,.stDateInput label,.stSlider label{color:#888!important;font-size:13px!important;font-family:'Inter',sans-serif!important;}
-.stSelectbox>div>div{background:#111!important;border:1px solid #333!important;border-radius:8px!important;color:#ffffff!important;font-weight:500!important;}
-.stMultiSelect>div>div{background:#111!important;border:1px solid #333!important;border-radius:8px!important;color:#ffffff!important;}
-[data-testid="stMultiSelect"] span[data-baseweb="tag"]{background:#222!important;border:1px solid #444!important;border-radius:4px!important;color:#fff!important;}
-.stRadio label{color:#ddd!important;font-size:15px!important;}
-.stCheckbox label{color:#ddd!important;font-size:15px!important;}
-.stProgress>div>div{background:#1a1a1a!important;border-radius:4px!important;}
-.stProgress>div>div>div{background:#fff!important;border-radius:4px!important;}
-.stButton>button{background:#fff!important;color:#000!important;border:none!important;border-radius:8px!important;padding:0.6rem 1.2rem!important;font-family:'Inter',sans-serif!important;font-weight:600!important;font-size:14px!important;width:100%!important;min-height:44px!important;transition:opacity 0.15s!important;}
-.stButton>button:hover{opacity:0.82!important;}
-.stDateInput>div>div>input{background:#111!important;border:1px solid #333!important;color:#fff!important;border-radius:8px!important;font-weight:500!important;}
-[data-testid="stMetricValue"]{color:#fff!important;font-family:'Inter',sans-serif!important;font-weight:700!important;}
-[data-testid="stMetricLabel"]{color:#666!important;font-family:'Inter',sans-serif!important;}
-.stCaption,.stCaption p{color:#666!important;font-family:'Inter',sans-serif!important;}
-hr{border-color:#1e1e1e!important;}
-[data-testid="stFileUploader"]{background:#111!important;border:1px dashed #333!important;border-radius:8px!important;}
-[data-testid="stVerticalBlockBorderWrapper"]{border:1px solid #2a2a2a!important;border-radius:12px!important;background:#0d0d0d!important;box-shadow:0 0 0 1px #222,0 4px 24px rgba(0,0,0,0.6)!important;}
-p,div,span{font-family:'Inter',sans-serif!important;}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+/* Design Tokens */
+:root{
+  --bg: #07070d;
+  --bg-soft: #0d0d18;
+  --bg-card: #0f0f1c;
+  --bg-input: #11111e;
+  --border: #1f1f33;
+  --border-soft: #15152a;
+  --text: #f1f5f9;
+  --text-soft: #94a3b8;
+  --text-mute: #475569;
+  --accent: #22d3ee;
+  --accent-hi: #67e8f9;
+  --accent-lo: #0891b2;
+  --accent-glow: rgba(34, 211, 238, 0.35);
+  --accent-soft: rgba(34, 211, 238, 0.12);
+}
+
+/* App-Grundfarben */
+html,body,[data-testid="stAppViewContainer"],[data-testid="stApp"]{
+  background: radial-gradient(ellipse at top, #0c0c1f 0%, #07070d 55%, #05050a 100%) !important;
+  background-attachment: fixed !important;
+  color: var(--text) !important;
+  font-family: 'Inter', sans-serif !important;
+}
+[data-testid="stHeader"]{background: transparent !important;}
+[data-testid="stToolbar"]{display: none !important;}
+.block-container{padding-top: 2rem !important; max-width: 640px !important;}
+p,div,span{font-family: 'Inter', sans-serif !important;}
+
+/* Inputs */
+.stTextInput>div>div>input, .stTextArea>div>textarea{
+  background: var(--bg-input) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 10px !important;
+  color: var(--text) !important;
+  font-family: 'Inter', sans-serif !important;
+  font-size: 15px !important;
+  font-weight: 500 !important;
+  transition: border-color 0.18s, box-shadow 0.18s !important;
+}
+.stTextInput>div>div>input::placeholder, .stTextArea>div>textarea::placeholder{
+  color: var(--text-mute) !important;
+}
+.stTextInput>div>div>input:focus, .stTextArea>div>textarea:focus{
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--accent-soft) !important;
+}
+
+/* Labels */
+.stTextInput label, .stTextArea label, .stSelectbox label, .stMultiSelect label,
+.stDateInput label, .stSlider label, .stNumberInput label{
+  color: var(--text-soft) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  font-family: 'Inter', sans-serif !important;
+}
+
+/* Select / Multiselect */
+.stSelectbox>div>div, .stMultiSelect>div>div{
+  background: var(--bg-input) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 10px !important;
+  color: var(--text) !important;
+  font-weight: 500 !important;
+}
+[data-testid="stMultiSelect"] span[data-baseweb="tag"]{
+  background: var(--accent-soft) !important;
+  border: 1px solid rgba(34, 211, 238, 0.35) !important;
+  border-radius: 6px !important;
+  color: var(--accent-hi) !important;
+}
+
+/* Radio & Checkbox */
+.stRadio label, .stCheckbox label{
+  color: var(--text) !important;
+  font-size: 15px !important;
+}
+
+/* Progress */
+.stProgress>div>div{background: var(--bg-soft) !important; border-radius: 6px !important; height: 6px !important;}
+.stProgress>div>div>div{
+  background: linear-gradient(90deg, var(--accent-lo), var(--accent), var(--accent-hi)) !important;
+  border-radius: 6px !important;
+  box-shadow: 0 0 12px var(--accent-glow) !important;
+}
+
+/* === BUTTONS (Hauptaktion: Cyan-Gradient mit Glow) === */
+.stButton>button{
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-lo) 100%) !important;
+  color: #04141a !important;
+  border: 1px solid rgba(34, 211, 238, 0.5) !important;
+  border-radius: 12px !important;
+  padding: 0.75rem 0.9rem !important;
+  font-family: 'Inter', sans-serif !important;
+  font-weight: 700 !important;
+  font-size: 14px !important;
+  letter-spacing: -0.005em !important;
+  width: 100% !important;
+  height: 48px !important;
+  min-height: 48px !important;
+  max-height: 48px !important;
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  line-height: 1 !important;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.45), 0 0 0 0 var(--accent-glow) !important;
+  transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease !important;
+}
+.stButton>button>div, .stButton>button>div>p{
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  line-height: 1 !important;
+}
+.stButton>button:hover{
+  background: linear-gradient(135deg, var(--accent-hi) 0%, var(--accent) 100%) !important;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.55), 0 0 24px var(--accent-glow) !important;
+  transform: translateY(-1px) !important;
+}
+.stButton>button:active{transform: translateY(0) !important;}
+
+/* Sekundärer Button-Stil (über key="..._secondary") */
+.stButton>button[kind="secondary"], .stButton>button[data-testid*="secondary"]{
+  background: var(--bg-card) !important;
+  color: var(--accent-hi) !important;
+  border: 1px solid var(--border) !important;
+  box-shadow: none !important;
+}
+.stButton>button[kind="secondary"]:hover{
+  border-color: var(--accent) !important;
+  color: var(--accent-hi) !important;
+  background: var(--accent-soft) !important;
+}
+
+/* Date Input */
+.stDateInput>div>div>input{
+  background: var(--bg-input) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text) !important;
+  border-radius: 10px !important;
+  font-weight: 500 !important;
+}
+
+/* Metrics */
+[data-testid="stMetricValue"]{
+  color: var(--accent-hi) !important;
+  font-family: 'Inter', sans-serif !important;
+  font-weight: 800 !important;
+}
+[data-testid="stMetricLabel"]{
+  color: var(--text-mute) !important;
+  font-family: 'Inter', sans-serif !important;
+}
+
+/* Captions */
+.stCaption, .stCaption p{color: var(--text-mute) !important; font-family: 'Inter', sans-serif !important;}
+
+/* HR */
+hr{border-color: var(--border-soft) !important;}
+
+/* File Uploader */
+[data-testid="stFileUploader"]{
+  background: var(--bg-input) !important;
+  border: 1px dashed var(--border) !important;
+  border-radius: 10px !important;
+}
+
+/* Cards / Container */
+[data-testid="stVerticalBlockBorderWrapper"]{
+  border: 1px solid var(--border) !important;
+  border-radius: 14px !important;
+  background: var(--bg-card) !important;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset, 0 8px 28px rgba(0,0,0,0.55) !important;
+}
+
+/* Slider Thumb */
+.stSlider [data-baseweb="slider"] div[role="slider"]{
+  background: var(--accent) !important;
+  box-shadow: 0 0 12px var(--accent-glow) !important;
+}
+
+/* Links */
+a{color: var(--accent-hi) !important;}
+a:hover{color: var(--accent) !important;}
 </style>
 """,unsafe_allow_html=True)
 
-#  Header (nur auf Nicht-Startseite) 
+#  Header (nur auf Nicht-Startseite)
 if st.session_state.step != 0:
-    st.markdown("<div style='text-align:center;padding:4px 0 24px 0;'><span style='font-size:30px;font-weight:700;color:#fff;letter-spacing:-0.03em;font-family:Inter,sans-serif;'>JobMatch AI</span><br><span style='font-size:12px;color:#555;letter-spacing:0.08em;text-transform:uppercase;font-family:Inter,sans-serif;'>Find jobs that fit your life</span></div>",unsafe_allow_html=True)
+    _xp_h, _streak_h, _badges_h = get_user_activity()
+    _active_h = is_active_user(_xp_h, _streak_h, _badges_h)
+    _active_pill = (
+        f"""<div style='display:inline-flex;align-items:center;gap:8px;background:linear-gradient(135deg,rgba(34,211,238,0.12),rgba(6,182,212,0.08));border:1px solid rgba(34,211,238,0.35);border-radius:999px;padding:5px 12px;margin-top:14px;font-family:Inter,sans-serif;'>
+            <span style='display:inline-block;width:6px;height:6px;border-radius:50%;background:#22d3ee;box-shadow:0 0 8px rgba(34,211,238,0.9);'></span>
+            <span style='font-size:11px;font-weight:700;color:#67e8f9;letter-spacing:0.04em;'>VERIFIED ACTIVE</span>
+            <span style='font-size:11px;color:#475569;'>·</span>
+            <span style='font-size:11px;color:#94a3b8;font-weight:600;'>{_streak_h}🔥</span>
+            <span style='font-size:11px;color:#475569;'>·</span>
+            <span style='font-size:11px;color:#94a3b8;font-weight:600;'>{_xp_h} XP</span>
+        </div>"""
+        if _active_h else ""
+    )
+    st.markdown(f"""
+<div style='text-align:center;padding:6px 0 28px 0;display:flex;flex-direction:column;align-items:center;gap:2px;'>
+  <div style='display:inline-flex;align-items:baseline;gap:6px;'>
+    <span style='font-size:34px;font-weight:900;letter-spacing:-0.05em;font-family:Inter,sans-serif;background:linear-gradient(135deg,#67e8f9 0%,#22d3ee 45%,#06b6d4 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;'>jobr</span>
+    <span style='display:inline-block;width:7px;height:7px;border-radius:50%;background:#22d3ee;box-shadow:0 0 14px rgba(34,211,238,0.85);margin-bottom:6px;animation:jobrPulse 2.4s ease-in-out infinite;'></span>
+  </div>
+  <span style='font-size:10px;color:#475569;letter-spacing:0.22em;text-transform:uppercase;font-family:Inter,sans-serif;font-weight:600;'>finde was du wirklich willst</span>
+  {_active_pill}
+</div>
+<style>
+@keyframes jobrPulse {{
+  0%, 100% {{ transform: scale(1); opacity: 1; box-shadow: 0 0 14px rgba(34,211,238,0.85); }}
+  50% {{ transform: scale(1.4); opacity: 0.7; box-shadow: 0 0 22px rgba(34,211,238,1); }}
+}}
+</style>
+""", unsafe_allow_html=True)
 
 if 2<=st.session_state.step<=12 and st.session_state.app_mode=="suche":
     cs=st.session_state.step-1
@@ -772,32 +1026,34 @@ if 100<=st.session_state.step<=106 and st.session_state.app_mode=="biete":
 if st.session_state.step==0:
     st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
-@keyframes glow{0%,100%{opacity:.2}50%{opacity:.7}}
+@keyframes glow{0%,100%{opacity:.25}50%{opacity:.8}}
 @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-.hero{background:linear-gradient(150deg,#06060e,#0c0b1e,#040408);border-radius:22px;padding:52px 24px 44px;text-align:center;position:relative;overflow:hidden;border:1px solid #1a1830;margin-bottom:14px;}
-.hero-g1{position:absolute;top:-70px;left:-70px;width:260px;height:260px;background:radial-gradient(circle,rgba(99,102,241,.22) 0%,transparent 65%);border-radius:50%;animation:glow 5s ease-in-out infinite;pointer-events:none;}
-.hero-g2{position:absolute;bottom:-50px;right:-50px;width:200px;height:200px;background:radial-gradient(circle,rgba(139,92,246,.16) 0%,transparent 65%);border-radius:50%;animation:glow 7s ease-in-out infinite reverse;pointer-events:none;}
-.hero-logo{font-size:52px;font-weight:900;letter-spacing:-.05em;background:linear-gradient(135deg,#fff 0%,#c7d2fe 40%,#a5b4fc 65%,#818cf8 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;animation:fadeUp .5s both;}
-.hero-sub{font-size:13px;color:#3d4c6b;letter-spacing:.15em;text-transform:uppercase;margin-top:6px;animation:fadeUp .5s .1s both;}
-.hero-tag{font-size:16px;color:#7080a0;margin-top:16px;line-height:1.6;animation:fadeUp .6s .15s both;}
-.hero-stats{display:flex;gap:10px;margin-top:28px;animation:fadeUp .7s .2s both;}
-.hero-stat{flex:1;background:rgba(255,255,255,.03);border:1px solid #1e1e35;border-radius:14px;padding:18px 8px;}
-.hero-stat-n{font-size:30px;font-weight:900;background:linear-gradient(135deg,#fff,#a5b4fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;}
-.hero-stat-l{font-size:10px;color:#475569;text-transform:uppercase;letter-spacing:.08em;margin-top:6px;}
-.hero-quote{margin-top:22px;font-size:11px;color:#1e2535;font-style:italic;animation:fadeUp .8s .3s both;}
+@keyframes heroPulse{0%,100%{transform:scale(1);opacity:1;}50%{transform:scale(1.35);opacity:.7;}}
+.hero{background:linear-gradient(150deg,#07071a 0%,#0a1226 45%,#040810 100%);border-radius:24px;padding:56px 26px 46px;text-align:center;position:relative;overflow:hidden;border:1px solid #1a2840;margin-bottom:14px;}
+.hero-g1{position:absolute;top:-80px;left:-80px;width:280px;height:280px;background:radial-gradient(circle,rgba(34,211,238,.32) 0%,transparent 65%);border-radius:50%;animation:glow 5s ease-in-out infinite;pointer-events:none;}
+.hero-g2{position:absolute;bottom:-60px;right:-60px;width:220px;height:220px;background:radial-gradient(circle,rgba(103,232,249,.18) 0%,transparent 65%);border-radius:50%;animation:glow 7s ease-in-out infinite reverse;pointer-events:none;}
+.hero-logo{font-size:64px;font-weight:900;letter-spacing:-.07em;background:linear-gradient(135deg,#a5f3fc 0%,#67e8f9 40%,#22d3ee 70%,#06b6d4 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;animation:fadeUp .5s both;display:inline-flex;align-items:baseline;gap:8px;}
+.hero-logo-dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#22d3ee;box-shadow:0 0 18px rgba(34,211,238,0.9);animation:heroPulse 2.4s ease-in-out infinite;align-self:center;}
+.hero-sub{font-size:12px;color:#64748b;letter-spacing:.22em;text-transform:uppercase;margin-top:10px;animation:fadeUp .5s .1s both;font-weight:600;}
+.hero-tag{font-size:16px;color:#94a3b8;margin-top:18px;line-height:1.6;animation:fadeUp .6s .15s both;}
+.hero-stats{display:flex;gap:10px;margin-top:30px;animation:fadeUp .7s .2s both;}
+.hero-stat{flex:1;background:rgba(34,211,238,0.05);border:1px solid rgba(34,211,238,0.18);border-radius:14px;padding:18px 8px;backdrop-filter:blur(6px);}
+.hero-stat-n{font-size:30px;font-weight:900;background:linear-gradient(135deg,#a5f3fc 0%,#22d3ee 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;}
+.hero-stat-l{font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-top:6px;font-weight:600;}
+.hero-quote{margin-top:22px;font-size:11px;color:#334155;font-style:italic;animation:fadeUp .8s .3s both;}
 .chips{display:flex;gap:8px;margin-bottom:14px;}
-.chip{flex:1;background:#08080e;border:1px solid #1a1a2e;border-radius:12px;padding:11px 6px;text-align:center;}
-.chip-t{font-size:11px;font-weight:700;color:#c7d2fe;margin-bottom:2px;}
-.chip-s{font-size:10px;color:#3d4c6b;}
+.chip{flex:1;background:#0a0a18;border:1px solid #1a2840;border-radius:12px;padding:11px 6px;text-align:center;}
+.chip-t{font-size:11px;font-weight:700;color:#67e8f9;margin-bottom:2px;}
+.chip-s{font-size:10px;color:#475569;}
 </style>""", unsafe_allow_html=True)
 
     st.markdown('''
 <div class="hero">
   <div class="hero-g1"></div><div class="hero-g2"></div>
   <div style="position:relative;z-index:1;">
-    <div class="hero-logo">JobMatch AI</div>
-    <div class="hero-sub">Find your next job</div>
-    <div class="hero-tag">Swipe. Match. Bewerb dich.<br><span style="color:#94a3b8;">Der Traumjob wartet — wirklich.</span></div>
+    <div class="hero-logo">jobr<span class="hero-logo-dot"></span></div>
+    <div class="hero-sub">Find your next move</div>
+    <div class="hero-tag">Swipe. Match. Bewerb dich.<br><span style="color:#cbd5e1;">Der nächste Schritt wartet — wirklich.</span></div>
     <div class="hero-stats">
       <div class="hero-stat"><div class="hero-stat-n">10+</div><div class="hero-stat-l">Jobs heute</div></div>
       <div class="hero-stat"><div class="hero-stat-n">88%</div><div class="hero-stat-l">Avg. Match</div></div>
@@ -893,11 +1149,13 @@ elif st.session_state.step==1 and st.session_state.app_mode=="suche":
                             streak_saved = saved.pop("_streak", 0)
                             badges_saved = saved.pop("_badges", [])
                             ref_saved = saved.pop("_ref_code", "")
+                            last_boost_saved = saved.pop("_last_boost_week", "")
                             st.session_state.profile.update(saved)
                             st.session_state.xp = xp_saved
                             st.session_state.streak_count = streak_saved
                             st.session_state.badges = badges_saved
                             st.session_state.referral_code = ref_saved
+                            st.session_state.last_boost_week = last_boost_saved
                             # Lade Bewerbungen
                             apps = sb_load_applications(user.id)
                             if apps: st.session_state.applications = apps
@@ -1147,7 +1405,7 @@ elif st.session_state.step==30 and st.session_state.app_mode=="suche":
     st.markdown("<p style='font-size:14px;font-weight:700;color:#fff;margin-bottom:8px;'>Aktivitäten</p>", unsafe_allow_html=True)
     if _feed30:
         for _fe30 in _feed30[:5]:
-            st.markdown("<div style='padding:8px 0;border-bottom:1px solid #111;font-size:13px;color:#94a3b8;'><span style='color:#6366f1;font-weight:700;'>+" + str(_fe30["xp"]) + " XP</span> · " + _fe30["text"] + " <span style='color:#374151;font-size:11px;'>(" + _fe30["date"] + ")</span></div>", unsafe_allow_html=True)
+            st.markdown("<div style='padding:8px 0;border-bottom:1px solid #15152a;font-size:13px;color:#94a3b8;'><span style='color:#22d3ee;font-weight:700;'>+" + str(_fe30["xp"]) + " XP</span> · " + _fe30["text"] + " <span style='color:#475569;font-size:11px;'>(" + _fe30["date"] + ")</span></div>", unsafe_allow_html=True)
     else:
         st.markdown("<p style='font-size:12px;color:#374151;'>Noch keine Aktivitäten — leg los und verdiene XP!</p>", unsafe_allow_html=True)
     st.divider()
@@ -1333,7 +1591,23 @@ elif st.session_state.step==12 and st.session_state.app_mode=="suche":
 # 
 elif st.session_state.step==13 and st.session_state.app_mode=="suche":
     if st.session_state.streak_count>=2:
-        st.markdown(f"<div style='background:#111;border:1px solid #2a2a2a;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px;color:#aaa;'>{st.session_state.streak_count} Tage in Folge aktiv — bleib dran!</div>",unsafe_allow_html=True)
+        st.markdown(f"<div style='background:linear-gradient(135deg,rgba(34,211,238,0.08),rgba(6,182,212,0.04));border:1px solid rgba(34,211,238,0.25);border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px;color:#cbd5e1;'>🔥 {st.session_state.streak_count} Tage in Folge aktiv — bleib dran!</div>",unsafe_allow_html=True)
+
+    # Early-Access-Hinweis fuer inaktive User
+    _locked_count = st.session_state.get("early_access_locked_count", 0)
+    if _locked_count > 0:
+        st.markdown(
+            f"""<div style='background:linear-gradient(135deg,rgba(167,139,250,0.10),rgba(34,211,238,0.05));border:1px dashed rgba(167,139,250,0.45);border-radius:12px;padding:14px 16px;margin-bottom:14px;'>
+              <div style='display:flex;align-items:center;gap:10px;'>
+                <div style='font-size:22px;'>🔒</div>
+                <div style='flex:1;'>
+                  <div style='font-size:13px;font-weight:700;color:#a5f3fc;margin-bottom:2px;'>{_locked_count} brandneue {'Job wartet' if _locked_count == 1 else 'Jobs warten'} auf dich</div>
+                  <div style='font-size:11px;color:#94a3b8;line-height:1.5;'>Werde aktiv (3+ Tage Streak oder 100 XP) — dann siehst du frische Stellen <b style='color:#67e8f9;'>24h früher</b> als alle anderen.</div>
+                </div>
+              </div>
+            </div>""",
+            unsafe_allow_html=True
+        )
 
     if st.session_state.show_anschreiben and st.session_state.anschreiben_job:
         job=st.session_state.anschreiben_job
@@ -1368,13 +1642,13 @@ elif st.session_state.step==13 and st.session_state.app_mode=="suche":
 
     col_a,col_b,col_c,col_d=st.columns(4)
     with col_a:
-        if st.button("Filter",use_container_width=True): st.session_state.step=3; st.rerun()
+        if st.button("Filter", use_container_width=True, key="nav_filter"): st.session_state.step=3; st.rerun()
     with col_b:
-        if st.button("Favoriten",use_container_width=True): st.session_state.step=14; st.rerun()
+        if st.button("Favoriten", use_container_width=True, key="nav_fav"): st.session_state.step=14; st.rerun()
     with col_c:
-        if st.button("Bewerbungen",use_container_width=True): st.session_state.step=15; st.rerun()
+        if st.button("Tracker", use_container_width=True, key="nav_tracker"): st.session_state.step=15; st.rerun()
     with col_d:
-        if st.button(" Feed",use_container_width=True): st.session_state.step=30; st.rerun()
+        if st.button("Feed", use_container_width=True, key="nav_feed"): st.session_state.step=30; st.rerun()
     sel=st.selectbox("Sortierung",["Passendste","Neueste","Dringend"],index=["Passendste","Neueste","Dringend"].index(st.session_state.sort_mode))
     if sel!=st.session_state.sort_mode:
         st.session_state.sort_mode=sel; st.session_state.matches=calculate_matches(st.session_state.profile); st.session_state.current_match_index=0; st.rerun()
@@ -1432,7 +1706,7 @@ elif st.session_state.step==13 and st.session_state.app_mode=="suche":
                 _days = (_cd - date.today()).days
                 if _days <= 2: _cd_html = "<span style='background:#ef444422;color:#ef4444;border:1px solid #ef444444;border-radius:999px;padding:3px 10px;font-size:11px;font-weight:700;'> Noch " + str(_days) + " Tag(e)!</span>"
                 elif _days <= 7: _cd_html = "<span style='background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b44;border-radius:999px;padding:3px 10px;font-size:11px;'> Noch " + str(_days) + " Tage</span>"
-            _skills_html = "".join(["<span style='display:inline-block;background:#6366f114;border:1px solid #6366f130;border-radius:999px;padding:3px 9px;font-size:11px;color:#a5b4fc;margin:2px;'>" + s + "</span>" for s in job.get("skills",[])])
+            _skills_html = "".join(["<span style='display:inline-block;background:rgba(34,211,238,0.08);border:1px solid rgba(34,211,238,0.28);border-radius:999px;padding:3px 9px;font-size:11px;color:#67e8f9;margin:2px;'>" + s + "</span>" for s in job.get("skills",[])])
             _ben_html = "".join(["<span style='display:inline-block;background:#ffffff08;border:1px solid #222;border-radius:999px;padding:3px 9px;font-size:11px;color:#666;margin:2px;'>" + b + "</span>" for b in job.get("benefits",[])])
             _match_line = "".join(["<span style='font-size:11px;color:#4b5563;display:block;margin:2px 0;'>— " + r + "</span>" for _,r in job.get("reason_parts",[])])
             _card = (
@@ -1568,6 +1842,46 @@ elif st.session_state.step==15 and st.session_state.app_mode=="suche":
             if st.button(chat_label, key=f"chat_{tab_prefix}_{i}", use_container_width=True):
                 st.session_state.active_chat = i
                 st.session_state.step = 19; st.rerun()
+
+            # === BOOST: 1x pro Woche eine Bewerbung priorisieren ===
+            _boosted_at = app.get("_boosted_at")
+            _db_id = app.get("_db_id")
+            _status = app["status"]
+            _can_close = _status in ("Abgelehnt","Angenommen")
+
+            if _boosted_at:
+                st.markdown(
+                    "<div style='margin-top:10px;display:flex;align-items:center;gap:8px;background:linear-gradient(135deg,rgba(34,211,238,0.18),rgba(6,182,212,0.10));border:1px solid rgba(34,211,238,0.5);border-radius:10px;padding:8px 12px;'>"
+                    "<span style='font-size:14px;'>⚡</span>"
+                    "<span style='font-size:12px;font-weight:700;color:#67e8f9;letter-spacing:0.04em;'>GEBOOSTET</span>"
+                    "<span style='font-size:11px;color:#94a3b8;flex:1;'>Diese Bewerbung steht beim Arbeitgeber ganz oben.</span>"
+                    "</div>",
+                    unsafe_allow_html=True
+                )
+            elif not _can_close:
+                _can_boost = can_boost_this_week()
+                if _can_boost and _db_id:
+                    if st.button("⚡ Bewerbung boosten (1x diese Woche)", key=f"boost_{tab_prefix}_{i}", use_container_width=True):
+                        _uid = st.session_state.account.get("sb_user_id")
+                        if _uid:
+                            ok, msg = sb_boost_application(_uid, _db_id)
+                            if ok:
+                                st.session_state.last_boost_week = get_iso_week_str()
+                                st.session_state.applications[i]["_boosted_at"] = datetime.now(timezone.utc).isoformat()
+                                st.toast("⚡ Boost aktiv!", icon="⚡")
+                                st.rerun()
+                            else:
+                                st.warning(msg)
+                        else:
+                            # Lokaler Fallback ohne Supabase
+                            st.session_state.last_boost_week = get_iso_week_str()
+                            st.session_state.applications[i]["_boosted_at"] = datetime.now(timezone.utc).isoformat()
+                            st.rerun()
+                elif not _can_boost:
+                    st.markdown(
+                        "<div style='margin-top:8px;font-size:11px;color:#475569;text-align:center;'>⚡ Diese Woche hast du deinen Boost schon eingelöst.</div>",
+                        unsafe_allow_html=True
+                    )
 
             # Interview-Vorbereitung
             if app["status"] in ["Interview","Angebot"]:
@@ -2021,10 +2335,22 @@ elif st.session_state.step==107 and st.session_state.app_mode=="biete":
         if not eigene_bewerbungen:
             st.info("Noch keine Bewerbungen auf deine Jobs eingegangen.")
         else:
-            # Gruppiert nach Job
+            # Gruppiert nach Job — Bewerber sortiert: geboostete zuerst, dann nach activity_score und Match-Score
+            _viewer_xp, _viewer_streak, _viewer_badges = get_user_activity()
+            _viewer_active = is_active_user(_viewer_xp, _viewer_streak, _viewer_badges)
+            _viewer_act_score = compute_activity_score(_viewer_xp, _viewer_streak, _viewer_badges)
+
+            def _bewerber_sort_key(item):
+                _, _app = item
+                _boost = 1 if _app.get("_boosted_at") else 0
+                # In dieser Demo stammen alle Bewerbungen vom eingeloggten User → activity_score == viewer-Score.
+                # In echter Multi-User-App wuerde man hier pro Bewerbung den User-Activity-Score auflösen.
+                return (-_boost, -_viewer_act_score, -(_app.get("score") or 0))
+
             for job in st.session_state.posted_jobs:
                 job_bewerber = [(idx,a) for idx,a in eigene_bewerbungen if a["title"]==job["title"]]
                 if not job_bewerber: continue
+                job_bewerber.sort(key=_bewerber_sort_key)
 
                 st.markdown(f"<p style='font-size:15px;font-weight:700;color:#fff;margin:12px 0 8px 0;'>{job['title']} ({len(job_bewerber)} Bewerbung(en))</p>",unsafe_allow_html=True)
 
@@ -2034,12 +2360,23 @@ elif st.session_state.step==107 and st.session_state.app_mode=="biete":
                         "Angebot":"#ccc","Angenommen":"#fff","Abgelehnt":"#444","Gemerkt":"#555"
                     }
                     sc = STATUS_COLORS.get(app["status"],"#666")
+                    _is_boosted_app = bool(app.get("_boosted_at"))
 
                     with st.container(border=True):
+                        # Boost-Banner ueber der Karte
+                        if _is_boosted_app:
+                            st.markdown(
+                                "<div style='display:inline-flex;align-items:center;gap:6px;background:linear-gradient(135deg,#22d3ee,#06b6d4);color:#04141a;border-radius:8px;padding:3px 10px;font-size:11px;font-weight:800;letter-spacing:0.04em;margin-bottom:8px;'>⚡ TOP-BEWERBUNG</div>",
+                                unsafe_allow_html=True
+                            )
                         col_info, col_stat = st.columns([3,1])
                         with col_info:
-                            st.markdown(f"<p style='font-weight:600;color:#fff;margin:0 0 2px 0;'>Bewerber #{bidx+1}</p>",unsafe_allow_html=True)
-                            st.caption(f"{app['city']} · {app['job_type']} · {app['score']}% Match")
+                            _name_html = f"<p style='font-weight:600;color:#fff;margin:0 0 2px 0;'>Bewerber #{bidx+1}"
+                            if _viewer_active:
+                                _name_html += " <span style='display:inline-block;vertical-align:middle;margin-left:4px;background:rgba(34,211,238,0.15);border:1px solid rgba(34,211,238,0.4);border-radius:999px;padding:1px 7px;font-size:9px;font-weight:700;color:#67e8f9;letter-spacing:0.04em;'>VERIFIED ACTIVE</span>"
+                            _name_html += "</p>"
+                            st.markdown(_name_html, unsafe_allow_html=True)
+                            st.caption(f"{app['city']} · {app['job_type']} · {app['score']}% Match · Activity {_viewer_act_score}")
                             st.markdown(f"<p style='font-size:12px;color:#666;margin:4px 0 0 0;'>{app['description'][:80]}...</p>",unsafe_allow_html=True)
                         with col_stat:
                             st.markdown(f"<div style='text-align:right;padding-top:4px;'><span style='font-size:11px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:999px;padding:3px 10px;color:{sc};'>{app['status']}</span></div>",unsafe_allow_html=True)

@@ -1,25 +1,27 @@
 # Globale Streamlit-Einstellungen.
 # Theme-Farben werden hier zentral gesetzt — du kannst sie spaeter jederzeit anpassen,
 # ohne im Python-Code suchen zu muessen.
+# Diese Werte sind die Streamlit-Defaults. Der eigentliche Look kommt aus dem
+# CSS-Block in app.py und ueberschreibt diese fast komplett.
 
 [theme]
-# Hauptfarbe (Buttons, Links, aktive Elemente)
-primaryColor = "#4F46E5"
+# Hauptfarbe (Buttons, Links, aktive Elemente) — Jobr Cyan
+primaryColor = "#22D3EE"
 
 # Haupt-Hintergrund der App
-backgroundColor = "#FFFFFF"
+backgroundColor = "#07070D"
 
 # Sekundaerer Hintergrund (Sidebar, Cards)
-secondaryBackgroundColor = "#F8F9FB"
+secondaryBackgroundColor = "#0F0F1C"
 
 # Standard-Textfarbe
-textColor = "#1F2937"
+textColor = "#F1F5F9"
 
 # Schriftart fuer die gesamte App
 font = "sans serif"
 
-# Optional: Basis-Theme (light oder dark)
-base = "light"
+# Basis-Theme
+base = "dark"
 
 
 [client]
