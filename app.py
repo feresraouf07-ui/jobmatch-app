@@ -883,7 +883,7 @@ p,div,span{font-family: 'Inter', sans-serif !important;}
   color: #04141a !important;
   border: 1px solid rgba(34, 211, 238, 0.5) !important;
   border-radius: 12px !important;
-  padding: 0.75rem 0.9rem !important;
+  padding: 0 14px !important;
   font-family: 'Inter', sans-serif !important;
   font-weight: 700 !important;
   font-size: 14px !important;
@@ -891,18 +891,23 @@ p,div,span{font-family: 'Inter', sans-serif !important;}
   width: 100% !important;
   height: 48px !important;
   min-height: 48px !important;
-  max-height: 48px !important;
   white-space: nowrap !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
-  line-height: 1 !important;
+  line-height: 48px !important;
   box-shadow: 0 4px 14px rgba(0,0,0,0.45), 0 0 0 0 var(--accent-glow) !important;
   transition: transform 0.15s ease, box-shadow 0.2s ease, background 0.2s ease !important;
 }
-.stButton>button>div, .stButton>button>div>p{
+.stButton>button > div{
   white-space: nowrap !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
+  line-height: 48px !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  height: 100% !important;
+  width: 100% !important;
+}
+.stButton>button > div > p{
+  white-space: nowrap !important;
+  margin: 0 !important;
   line-height: 1 !important;
 }
 .stButton>button:hover{
@@ -953,9 +958,53 @@ hr{border-color: var(--border-soft) !important;}
 
 /* File Uploader */
 [data-testid="stFileUploader"]{
+  background: transparent !important;
+}
+[data-testid="stFileUploader"] section,
+[data-testid="stFileUploader"] > section,
+[data-testid="stFileUploader"] > div > section{
   background: var(--bg-input) !important;
   border: 1px dashed var(--border) !important;
   border-radius: 10px !important;
+  padding: 14px !important;
+}
+[data-testid="stFileUploader"] section > div:first-child,
+[data-testid="stFileUploader"] section small{
+  color: var(--text-soft) !important;
+  font-size: 12px !important;
+}
+/* Browse-files-Button: nicht das Hauptbutton-Styling, sondern dezenter */
+[data-testid="stFileUploader"] button{
+  background: var(--bg-card) !important;
+  color: var(--accent-hi) !important;
+  border: 1px solid rgba(34,211,238,0.4) !important;
+  border-radius: 8px !important;
+  box-shadow: none !important;
+  height: 36px !important;
+  min-height: 36px !important;
+  line-height: 1 !important;
+  padding: 0 14px !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  width: auto !important;
+}
+[data-testid="stFileUploader"] button:hover{
+  background: var(--accent-soft) !important;
+  border-color: var(--accent) !important;
+  transform: none !important;
+}
+[data-testid="stFileUploader"] button > div{
+  line-height: 1 !important;
+  height: auto !important;
+}
+[data-testid="stFileUploaderDropzone"]{
+  background: var(--bg-input) !important;
+  border: 1px dashed var(--border) !important;
+  border-radius: 10px !important;
+}
+[data-testid="stFileUploaderDropzoneInstructions"] span,
+[data-testid="stFileUploaderDropzoneInstructions"] small{
+  color: var(--text-soft) !important;
 }
 
 /* Cards / Container */
@@ -1107,7 +1156,7 @@ elif st.session_state.step==1 and st.session_state.app_mode=="suche":
 
     if st.session_state.auth_mode=="register":
         st.divider()
-        email=st.text_input("E-Mail",placeholder="deinname@email.com")
+        email=st.text_input("E-Mail",placeholder="E-Mail-Adresse")
         password=st.text_input("Passwort",type="password",placeholder="Passwort wählen (mind. 6 Zeichen)")
         if st.button("Konto erstellen",use_container_width=True):
             if email.strip() and password.strip():
@@ -1132,7 +1181,7 @@ elif st.session_state.step==1 and st.session_state.app_mode=="suche":
 
     elif st.session_state.auth_mode=="login":
         st.divider()
-        email=st.text_input("E-Mail",placeholder="deinname@email.com")
+        email=st.text_input("E-Mail",placeholder="E-Mail-Adresse")
         password=st.text_input("Passwort",type="password",placeholder="Passwort eingeben")
         if st.button("Einloggen",key="login_btn",use_container_width=True):
             if email.strip() and password.strip():
