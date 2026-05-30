@@ -34,17 +34,32 @@ def sb_register(email, password):
         if "already" in msg.lower(): return None, "Diese E-Mail ist bereits registriert."
         return None, msg
 
+def sb_reset_password(email):
+    sb = get_sb()
+    if not sb: return False, "Supabase nicht verfügbar"
+    try:
+        sb.auth.reset_password_email(email)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
 def sb_login(email, password):
     sb = get_sb()
     if not sb: return None, "Supabase nicht verfügbar"
     try:
         res = sb.auth.sign_in_with_password({"email": email, "password": password})
         if res.user: return res.user, None
-        return None, "Login fehlgeschlagen."
+        return None, "Login fehlgeschlagen — bitte erneut versuchen."
     except Exception as e:
         msg = str(e)
-        if "Invalid" in msg: return None, "E-Mail oder Passwort falsch."
-        return None, msg
+        low = msg.lower()
+        if "invalid" in low and "credentials" in low:
+            return None, "E-Mail oder Passwort falsch."
+        if "email not confirmed" in low or "not confirmed" in low:
+            return None, "Email noch nicht bestätigt. Schau in dein Postfach (auch Spam) und klick den Bestätigungslink — oder deaktiviere die Bestätigung in Supabase: Authentication → Providers → Email → 'Confirm email' off."
+        if "rate limit" in low or "too many" in low:
+            return None, "Zu viele Login-Versuche. Bitte 1-2 Minuten warten."
+        return None, f"Login-Fehler: {msg}"
 
 # Profil
 def sb_save_profile(user_id, profile, xp=0, streak=0, badges=[], ref_code="", last_boost_week=None):
@@ -206,6 +221,60 @@ def sb_load_messages(user_id):
         return msgs
     except: return {}
 
+# Friend Groups
+def sb_create_group(user_id, group_name, display_name, xp=0):
+    sb = get_sb()
+    if not sb: return None, "Keine Verbindung"
+    import random, string as _str
+    code = "".join(random.choices(_str.ascii_uppercase + _str.digits, k=6))
+    try:
+        g = sb.table("friend_groups").insert({"name": group_name, "invite_code": code, "created_by": user_id}).execute()
+        group_id = g.data[0]["id"]
+        sb.table("group_members").insert({"group_id": group_id, "user_id": user_id, "display_name": display_name, "xp": xp, "applications_count": 0}).execute()
+        return {"id": group_id, "name": group_name, "invite_code": code}, None
+    except Exception as e:
+        return None, str(e)
+
+def sb_join_group(user_id, invite_code, display_name, xp=0):
+    sb = get_sb()
+    if not sb: return None, "Keine Verbindung"
+    try:
+        g = sb.table("friend_groups").select("*").eq("invite_code", invite_code.upper().strip()).execute()
+        if not g.data: return None, "Ungültiger Code — bitte prüfe nochmal"
+        group = g.data[0]
+        existing = sb.table("group_members").select("id").eq("group_id", group["id"]).eq("user_id", user_id).execute()
+        if not existing.data:
+            sb.table("group_members").insert({"group_id": group["id"], "user_id": user_id, "display_name": display_name, "xp": xp, "applications_count": 0}).execute()
+        return {"id": group["id"], "name": group["name"], "invite_code": group["invite_code"]}, None
+    except Exception as e:
+        return None, str(e)
+
+def sb_get_user_group(user_id):
+    sb = get_sb()
+    if not sb: return None
+    try:
+        res = sb.table("group_members").select("group_id, friend_groups(id, name, invite_code)").eq("user_id", user_id).limit(1).execute()
+        if res.data:
+            fg = res.data[0].get("friend_groups") or {}
+            if fg: return {"id": fg.get("id"), "name": fg.get("name",""), "invite_code": fg.get("invite_code","")}
+        return None
+    except: return None
+
+def sb_get_group_leaderboard(group_id):
+    sb = get_sb()
+    if not sb: return []
+    try:
+        res = sb.table("group_members").select("*").eq("group_id", group_id).order("xp", desc=True).execute()
+        return res.data or []
+    except: return []
+
+def sb_update_group_member(user_id, group_id, xp, applications_count):
+    sb = get_sb()
+    if not sb: return
+    try:
+        sb.table("group_members").update({"xp": xp, "applications_count": applications_count}).eq("user_id", user_id).eq("group_id", group_id).execute()
+    except: pass
+
 # Social Feed
 def sb_add_feed(user_id, username, text, xp):
     sb = get_sb()
@@ -222,6 +291,152 @@ def sb_load_feed():
         return [{"user": d.get("username","Anonym"), "text": d.get("text",""), "xp": d.get("xp",0),
                  "date": (d.get("created_at","") or "")[:10]} for d in (res.data or [])]
     except: return []
+
+# === Arbeitgeber-Posts (posted_jobs) ===
+def _posted_job_row_to_dict(d):
+    """Supabase-Row -> internes Job-Dict."""
+    return {
+        "title": d.get("title","") or "",
+        "company": d.get("company","") or "",
+        "city": d.get("city","") or "",
+        "country": d.get("country","Deutschland") or "Deutschland",
+        "job_type": d.get("job_type","Vollzeit") or "Vollzeit",
+        "work_model": d.get("work_model","Vor Ort") or "Vor Ort",
+        "salary_min": d.get("salary_min", 2500) or 2500,
+        "salary_unit": d.get("salary_unit","€/Monat") or "€/Monat",
+        "languages": d.get("languages") or [],
+        "experience": d.get("experience","Berufseinsteiger") or "Berufseinsteiger",
+        "skills": d.get("skills") or [],
+        "extra_skills_text": d.get("extra_skills_text","") or "",
+        "keywords_text": d.get("keywords_text","") or "",
+        "keywords": [w.strip().lower() for w in (d.get("keywords_text","") or "").split(",") if w.strip()] or [(d.get("title","") or "").lower()],
+        "description": d.get("description","") or "",
+        "requirements_text": d.get("requirements_text","") or "",
+        "benefits": d.get("benefits") or [],
+        "extra_benefits_text": d.get("extra_benefits_text","") or "",
+        "urgency": d.get("urgency", 5) or 5,
+        "recency": d.get("recency", 10) or 10,
+        "entry_friendly": bool(d.get("entry_friendly", False)),
+        "created_by_user": True,
+        "puls": "",
+        "job_status": d.get("job_status","Aktiv") or "Aktiv",
+        "_db_id": d.get("id"),
+        "_user_id": d.get("user_id"),
+    }
+
+def sb_save_posted_job(user_id, form):
+    """Speichert einen neuen Job-Post in Supabase. Gibt das gespeicherte Dict (mit _db_id) zurück oder None."""
+    sb = get_sb()
+    if not sb or not user_id: return None
+    try:
+        data = {
+            "user_id": user_id,
+            "title": form.get("title","").strip(),
+            "company": form.get("company","").strip(),
+            "city": form.get("city","").strip(),
+            "country": (form.get("country","").strip() or "Deutschland"),
+            "job_type": form.get("job_type","Vollzeit"),
+            "work_model": form.get("work_model","Vor Ort"),
+            "salary_min": int(form.get("salary_min", 2500) or 2500),
+            "salary_unit": form.get("salary_unit","€/Monat"),
+            "languages": form.get("languages") or [],
+            "experience": form.get("experience","Berufseinsteiger"),
+            "skills": combined_job_post_skills(form) if "combined_job_post_skills" in globals() else (form.get("skills") or []),
+            "extra_skills_text": form.get("extra_skills_text",""),
+            "keywords_text": form.get("keywords_text",""),
+            "description": form.get("description","").strip(),
+            "requirements_text": form.get("requirements_text","").strip(),
+            "benefits": combined_job_post_benefits(form) if "combined_job_post_benefits" in globals() else (form.get("benefits") or []),
+            "extra_benefits_text": form.get("extra_benefits_text",""),
+            "urgency": int(form.get("urgency", 5) or 5),
+            "recency": 10,
+            "entry_friendly": bool(form.get("entry_friendly", False)),
+            "job_status": "Aktiv",
+        }
+        res = sb.table("posted_jobs").insert(data).execute()
+        if res.data:
+            return _posted_job_row_to_dict(res.data[0])
+        return None
+    except Exception:
+        return None
+
+def sb_load_my_posted_jobs(user_id):
+    """Alle Job-Posts des eingeloggten Arbeitgebers laden."""
+    sb = get_sb()
+    if not sb or not user_id: return []
+    try:
+        res = sb.table("posted_jobs").select("*").eq("user_id", user_id).order("created_at", desc=True).execute()
+        return [_posted_job_row_to_dict(d) for d in (res.data or [])]
+    except Exception:
+        return []
+
+def sb_load_all_active_posted_jobs(limit=200):
+    """Alle aktiven Jobs (von allen Arbeitgebern) — fuer die Job-Suche."""
+    sb = get_sb()
+    if not sb: return []
+    try:
+        res = sb.table("posted_jobs").select("*").eq("job_status","Aktiv").order("created_at", desc=True).limit(limit).execute()
+        return [_posted_job_row_to_dict(d) for d in (res.data or [])]
+    except Exception:
+        return []
+
+def sb_update_posted_job_status(db_id, status):
+    sb = get_sb()
+    if not sb or not db_id: return False
+    try:
+        sb.table("posted_jobs").update({"job_status": status}).eq("id", db_id).execute()
+        return True
+    except Exception:
+        return False
+
+def sb_delete_posted_job(db_id):
+    sb = get_sb()
+    if not sb or not db_id: return False
+    try:
+        sb.table("posted_jobs").delete().eq("id", db_id).execute()
+        return True
+    except Exception:
+        return False
+
+# === Kuratierte Premium-Jobs (jobs-Tabelle) ===
+def _curated_job_row_to_dict(d):
+    """Supabase-Row aus 'jobs' -> internes Job-Dict."""
+    return {
+        "title": d.get("title","") or "",
+        "company": d.get("company","") or "",
+        "city": d.get("city","") or "",
+        "country": d.get("country","Deutschland") or "Deutschland",
+        "job_type": d.get("job_type","Vollzeit") or "Vollzeit",
+        "work_model": d.get("work_model","Vor Ort") or "Vor Ort",
+        "salary_min": d.get("salary_min", 2500) or 2500,
+        "salary_unit": d.get("salary_unit","€/Monat") or "€/Monat",
+        "languages": d.get("languages") or ["Deutsch"],
+        "experience": d.get("experience","Berufseinsteiger") or "Berufseinsteiger",
+        "skills": d.get("skills") or [],
+        "keywords": d.get("keywords") or [(d.get("title","") or "").lower()],
+        "description": d.get("description","") or "",
+        "requirements_text": d.get("requirements_text","") or "",
+        "benefits": d.get("benefits") or [],
+        "urgency": d.get("urgency", 5) or 5,
+        "recency": d.get("recency", 10) or 10,
+        "entry_friendly": bool(d.get("entry_friendly", True)),
+        "created_by_user": False,
+        "puls": d.get("puls","") or "",
+        "_curated": True,
+        "_featured": bool(d.get("featured", False)),
+        "_db_id": d.get("id"),
+        "_apply_url": d.get("apply_url",""),
+    }
+
+def sb_load_curated_jobs(limit=500):
+    """Alle aktiven kuratierten Jobs aus der jobs-Tabelle."""
+    sb = get_sb()
+    if not sb: return []
+    try:
+        res = sb.table("jobs").select("*").eq("is_active", True).order("featured", desc=True).order("created_at", desc=True).limit(limit).execute()
+        return [_curated_job_row_to_dict(d) for d in (res.data or [])]
+    except Exception:
+        return []
 
 # === Aktivitäts-System (XP / Streak / Badge / Boost) ===
 
@@ -400,6 +615,7 @@ DEFAULTS = {
     "referral_code":"","referred_friends":[],
     "countdown_jobs":{},"social_feed":[],
     "last_boost_week":"",
+    "group_info":None,"group_members":[],
 }
 for k,v in DEFAULTS.items():
     if k not in st.session_state:
@@ -417,10 +633,6 @@ if last != today_str:
     else: st.session_state.streak_count = 1
     st.session_state.streak_last_login = today_str
 
-# Test-Bewerbung vorinstallieren (Interview-Status zum Testen)
-TEST_APP = {"title":"Marketing & Communications Manager","city":"Düsseldorf","country":"Deutschland","job_type":"Vollzeit","work_model":"Hybrid","score":95,"status":"Interview","description":"Entwickle Kommunikationsstrategien, manage Social Media Kanäle und koordiniere externe Agenturen.","requirements_text":"Interesse an Marken und Kommunikation, kreatives Denken, gutes Sprachgefühl.","skills":["Marketing","Kommunikation","Social Media"],"experience":"Berufseinsteiger","salary_unit":"€/Monat"}
-if not any(a["title"]==TEST_APP["title"] for a in st.session_state.applications):
-    st.session_state.applications.append(TEST_APP)
 
 #  Helpers 
 def next_step(): st.session_state.step+=1; st.rerun()
@@ -432,10 +644,52 @@ def reset_all():
 def reset_employer_flow_only():
     st.session_state.job_post_form=default_job_post(); st.session_state.step=100; st.rerun()
 
+def reset_user_data():
+    """Leert ALLE nutzer-spezifischen Felder. Wird vor Login/Register aufgerufen,
+    damit ein neuer User NICHT die Daten eines vorigen Users im Browser sieht."""
+    st.session_state.profile = default_profile()
+    st.session_state.applications = []
+    st.session_state.liked_jobs = []
+    st.session_state.disliked_jobs = []
+    st.session_state.matches = []
+    st.session_state.current_match_index = 0
+    st.session_state.swipe_stats = {"likes":0,"dislikes":0}
+    st.session_state.consecutive_dislikes = 0
+    st.session_state.nachrichten = {}
+    st.session_state.xp = 0
+    st.session_state.level_name = "Newcomer"
+    st.session_state.level_color = "#6b7280"
+    st.session_state.badges = []
+    st.session_state.streak_count = 0
+    st.session_state.streak_last_login = None
+    st.session_state.referral_code = ""
+    st.session_state.referred_friends = []
+    st.session_state.countdown_jobs = {}
+    st.session_state.last_boost_week = ""
+    st.session_state.anschreiben_job = None
+    st.session_state.show_anschreiben = False
+    st.session_state.posted_jobs = []
+    st.session_state.active_chat = None
+    st.session_state.traumjob_analyse = None
+    st.session_state.early_access_locked_count = 0
+
 def city_distance(search_city, job_city):
-    s=search_city.strip().lower()
-    if s in DISTANCE_MATRIX: return DISTANCE_MATRIX[s].get(job_city,9999)
-    return 0 if s==job_city.strip().lower() else 9999
+    """Distanz zwischen zwei Staedten (case-insensitive).
+    Bei gleicher Stadt: 0. Bei bekannter Kombination: aus Matrix.
+    Sonst: 25 km Annahme (grosszuegig, damit Arbeitgeber-Posts in unbekannten
+    Staedten nicht aus der Suche fallen)."""
+    s = (search_city or "").strip().lower()
+    j = (job_city or "").strip().lower()
+    if not s or not j: return 9999
+    if s == j: return 0
+    if s in DISTANCE_MATRIX:
+        # case-insensitive Lookup
+        for k, v in DISTANCE_MATRIX[s].items():
+            if k.lower() == j: return v
+        # Sucher-Stadt in Matrix, Job-Stadt nicht: konservativ
+        return 50
+    # Sucher-Stadt nicht in Matrix: 25 km Annahme (passt zu Default-Umkreis)
+    return 25
 
 def is_work_model_compatible(user_model, job_model):
     if user_model=="Egal": return True
@@ -457,7 +711,28 @@ def combined_job_post_benefits(jp):
     return list(dict.fromkeys(jp["benefits"]+extra))
 
 def parse_keywords(text): return [k.strip().lower() for k in text.split(",") if k.strip()]
-def get_all_jobs(): return base_jobs()+st.session_state.posted_jobs
+@st.cache_data(ttl=120, show_spinner=False)
+def _cached_all_active_posts():
+    """Cached: alle aktiven Arbeitgeber-Posts. Wird alle 2 Min frisch geholt."""
+    return sb_load_all_active_posted_jobs(limit=200) if sb_available() else []
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_curated_jobs():
+    """Cached: alle aktiven kuratierten Jobs. Wird alle 5 Min frisch geholt."""
+    return sb_load_curated_jobs(limit=500) if sb_available() else []
+
+def get_all_jobs():
+    """Kuratierte Jobs aus DB + Arbeitgeber-Posts + Demo-Jobs (Fallback)."""
+    curated = _cached_curated_jobs()
+    db_posts = _cached_all_active_posts()
+    if not db_posts:
+        # Fallback: lokale Posts wenn DB leer/down
+        db_posts = st.session_state.get("posted_jobs", []) or []
+    # Wenn wir mind. 10 kuratierte Jobs haben, lassen wir die Demo-Jobs weg
+    # (sonst kommen Demo-Jobs als Fallback dazu)
+    if len(curated) >= 10:
+        return curated + db_posts
+    return curated + base_jobs() + db_posts
 
 def get_application_counts():
     counts={s:0 for s in APPLICATION_STATUSES}
@@ -479,7 +754,9 @@ def add_job_to_applications(job, status="Gemerkt"):
             "requirements_text":job.get("requirements_text",""),
             "skills":job.get("skills",[]),
             "experience":job.get("experience",""),
+            "salary_min":job.get("salary_min",0),
             "salary_unit":job.get("salary_unit","€/Monat"),
+            "applied_at":str(date.today()),
         })
 
 def update_application_status(index, new_status):
@@ -630,9 +907,21 @@ def save_job_post():
     form=st.session_state.job_post_form
     valid,message=validate_job_post(form)
     if not valid: st.warning(message); return
-    new_job={"title":form["title"].strip(),"city":form["city"].strip(),"country":form["country"].strip() or "Deutschland","job_type":form["job_type"],"work_model":form["work_model"],"salary_min":form["salary_min"],"salary_unit":form["salary_unit"],"languages":form["languages"],"experience":form["experience"],"skills":combined_job_post_skills(form),"keywords":parse_keywords(form["keywords_text"]) if form["keywords_text"].strip() else [form["title"].strip().lower()],"description":form["description"].strip(),"requirements_text":form["requirements_text"].strip(),"benefits":combined_job_post_benefits(form),"urgency":form["urgency"],"recency":10,"entry_friendly":form["entry_friendly"],"created_by_user":True,"puls":""}
+    # Lokales Dict (Fallback ohne Supabase)
+    new_job={"title":form["title"].strip(),"city":form["city"].strip(),"country":form["country"].strip() or "Deutschland","job_type":form["job_type"],"work_model":form["work_model"],"salary_min":form["salary_min"],"salary_unit":form["salary_unit"],"languages":form["languages"],"experience":form["experience"],"skills":combined_job_post_skills(form),"keywords":parse_keywords(form["keywords_text"]) if form["keywords_text"].strip() else [form["title"].strip().lower()],"description":form["description"].strip(),"requirements_text":form["requirements_text"].strip(),"benefits":combined_job_post_benefits(form),"urgency":form["urgency"],"recency":10,"entry_friendly":form["entry_friendly"],"created_by_user":True,"puls":"","job_status":"Aktiv"}
+    # In Supabase speichern wenn eingeloggt
+    uid = st.session_state.account.get("sb_user_id")
+    if uid and sb_available():
+        saved = sb_save_posted_job(uid, form)
+        if saved:
+            new_job = saved
+        else:
+            st.warning("Der Job wurde lokal gespeichert, aber nicht in Supabase. Versuche den Login neu.")
     st.session_state.posted_jobs.append(new_job)
     st.session_state.job_post_form=default_job_post()
+    # Cache der oeffentlichen Job-Liste leeren, damit der neue Post sofort sichtbar ist
+    try: _cached_all_active_posts.clear()
+    except Exception: pass
     st.session_state.step=107; st.rerun()
 
 def like_current_job():
@@ -930,6 +1219,65 @@ p,div,span{font-family: 'Inter', sans-serif !important;}
   background: var(--accent-soft) !important;
 }
 
+/* Logout-Button (key enthält "logout") — dezent, klein, kein Glow */
+.stButton>button[data-testid="header_logout_btn"],
+[data-testid="stButton"] button[kind="secondary"]{
+  background: transparent !important;
+  color: var(--text-mute) !important;
+  border: 1px solid var(--border-soft) !important;
+  box-shadow: none !important;
+  font-size: 12px !important;
+  height: 34px !important;
+  min-height: 34px !important;
+  line-height: 34px !important;
+  border-radius: 8px !important;
+}
+.stButton>button[data-testid="header_logout_btn"]:hover{
+  color: var(--text-soft) !important;
+  border-color: var(--border) !important;
+  background: rgba(255,255,255,0.04) !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+/* Global Zurück-Button — unsichtbarer Ghost-Text */
+.stButton>button[data-testid="global_back_btn"] {
+  background: transparent !important;
+  border: none !important;
+  color: rgba(255,255,255,0.32) !important;
+  font-size: 11px !important;
+  font-weight: 400 !important;
+  padding: 0 4px !important;
+  height: 24px !important;
+  min-height: 24px !important;
+  box-shadow: none !important;
+  letter-spacing: 0.02em !important;
+}
+.stButton>button[data-testid="global_back_btn"]:hover {
+  color: rgba(255,255,255,0.65) !important;
+  background: transparent !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+/* Reset-Link Button — dezenter Sekundär-Stil */
+[data-testid="stButton"]:has(button[data-testid="pw_reset_toggle"]) button,
+[data-testid="stButton"]:has(button[data-testid="pw_reset_send_btn"]) button {
+  background: transparent !important;
+  color: var(--text-mute) !important;
+  border: 1px solid var(--border-soft) !important;
+  box-shadow: none !important;
+  font-size: 13px !important;
+}
+[data-testid="stButton"]:has(button[data-testid="pw_reset_toggle"]) button:hover,
+[data-testid="stButton"]:has(button[data-testid="pw_reset_send_btn"]) button:hover {
+  color: var(--accent-hi) !important;
+  border-color: var(--accent) !important;
+  background: var(--accent-soft) !important;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
 /* Date Input */
 .stDateInput>div>div>input{
   background: var(--bg-input) !important;
@@ -1042,7 +1390,10 @@ if st.session_state.step != 0:
         </div>"""
         if _active_h else ""
     )
-    st.markdown(f"""
+    _logged_in_h = st.session_state.account.get("logged_in", False)
+    _header_col_logo, _header_col_logout = st.columns([5, 1])
+    with _header_col_logo:
+        st.markdown(f"""
 <div style='text-align:center;padding:6px 0 28px 0;display:flex;flex-direction:column;align-items:center;gap:2px;'>
   <div style='display:inline-flex;align-items:baseline;gap:6px;'>
     <span style='font-size:34px;font-weight:900;letter-spacing:-0.05em;font-family:Inter,sans-serif;background:linear-gradient(135deg,#67e8f9 0%,#22d3ee 45%,#06b6d4 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;'>jobr</span>
@@ -1058,6 +1409,16 @@ if st.session_state.step != 0:
 }}
 </style>
 """, unsafe_allow_html=True)
+    with _header_col_logout:
+        if _logged_in_h:
+            st.markdown("<div style='padding-top:18px;'></div>", unsafe_allow_html=True)
+            if st.button("Logout", key="header_logout_btn", use_container_width=True):
+                try:
+                    sb = get_sb()
+                    if sb: sb.auth.sign_out()
+                except Exception:
+                    pass
+                reset_all()
 
 if 2<=st.session_state.step<=12 and st.session_state.app_mode=="suche":
     cs=st.session_state.step-1
@@ -1069,7 +1430,16 @@ if 100<=st.session_state.step<=106 and st.session_state.app_mode=="biete":
     st.progress(cs/TOTAL_STEPS_EMPLOYER)
     st.caption(f"Schritt {cs} von {TOTAL_STEPS_EMPLOYER}")
 
-# 
+# Globaler Zurück-Button (dezenter Ghost-Text oben links, nur in Hauptschritten)
+_BACK_MAP = {14:13, 15:13, 16:13, 17:15, 18:13, 19:15, 21:13, 22:13}
+if st.session_state.step in _BACK_MAP:
+    _bc, _ = st.columns([1, 7])
+    with _bc:
+        if st.button("← zurück", key="global_back_btn"):
+            st.session_state.step = _BACK_MAP[st.session_state.step]
+            st.rerun()
+
+#
 # STEP 0 — Animierte Startseite
 # 
 if st.session_state.step==0:
@@ -1096,7 +1466,11 @@ if st.session_state.step==0:
 .chip-s{font-size:10px;color:#475569;}
 </style>""", unsafe_allow_html=True)
 
-    st.markdown('''
+    # Echte Job-Anzahl für Hero-Statistik
+    _curated_count = len(_cached_curated_jobs()) if sb_available() else 0
+    _hero_job_count = _curated_count if _curated_count >= 10 else len(base_jobs())
+
+    st.markdown(f'''
 <div class="hero">
   <div class="hero-g1"></div><div class="hero-g2"></div>
   <div style="position:relative;z-index:1;">
@@ -1104,8 +1478,8 @@ if st.session_state.step==0:
     <div class="hero-sub">Find your next move</div>
     <div class="hero-tag">Swipe. Match. Bewerb dich.<br><span style="color:#cbd5e1;">Der nächste Schritt wartet — wirklich.</span></div>
     <div class="hero-stats">
-      <div class="hero-stat"><div class="hero-stat-n">10+</div><div class="hero-stat-l">Jobs heute</div></div>
-      <div class="hero-stat"><div class="hero-stat-n">88%</div><div class="hero-stat-l">Avg. Match</div></div>
+      <div class="hero-stat"><div class="hero-stat-n">{_hero_job_count}+</div><div class="hero-stat-l">Aktuelle Jobs</div></div>
+      <div class="hero-stat"><div class="hero-stat-n">85%</div><div class="hero-stat-l">Ø Match-Score</div></div>
       <div class="hero-stat"><div class="hero-stat-n">3 Min</div><div class="hero-stat-l">Bis Bewerbung</div></div>
     </div>
     <div class="hero-quote">Ich hab in 10 Minuten meinen Traumjob gefunden. - Max, 24</div>
@@ -1125,7 +1499,7 @@ if st.session_state.step==0:
             st.session_state.app_mode="suche"; st.session_state.step=1; st.rerun()
     with col2:
         if st.button("Job einstellen", use_container_width=True):
-            st.session_state.app_mode="biete"; st.session_state.step=100; st.rerun()
+            st.session_state.app_mode="biete"; st.session_state.step=1; st.rerun()
 
     st.write("")
     _code_input = st.text_input("Freunde-Code", placeholder="z.B. JM-A3F9B2", label_visibility="visible")
@@ -1146,8 +1520,9 @@ if st.session_state.step==0:
 # 
 # STEP 1
 # 
-elif st.session_state.step==1 and st.session_state.app_mode=="suche":
-    H("Willkommen"); hint("Starte mit Login oder Registrierung.")
+elif st.session_state.step==1 and st.session_state.app_mode in ("suche","biete"):
+    _mode_label = "Job einstellen" if st.session_state.app_mode == "biete" else "Job-Suche"
+    H("Willkommen"); hint(f"Login oder Registrierung — du nutzt jobr als: {_mode_label}.")
     col1,col2=st.columns(2)
     with col1:
         if st.button("Einloggen",use_container_width=True): st.session_state.auth_mode="login"; st.rerun()
@@ -1165,18 +1540,26 @@ elif st.session_state.step==1 and st.session_state.app_mode=="suche":
                     if err:
                         st.error(err)
                     else:
+                        # KRITISCH: alte User-Daten leeren, damit neuer Account leer startet
+                        reset_user_data()
+                        st.session_state.account = default_account()
                         st.session_state.account.update({"email":email.strip(),"sb_user_id":user.id,"registered":True,"logged_in":True})
                         if st.session_state.get("pending_referral_bonus"):
                             add_xp("referral","Einladungscode eingelöst")
                             st.session_state.pending_referral_bonus = False
-                        st.session_state.step=20; st.rerun()
+                        # Ziel-Step je nach Modus
+                        st.session_state.step = 100 if st.session_state.app_mode == "biete" else 20
+                        st.rerun()
                 else:
                     # Fallback ohne Supabase
+                    reset_user_data()
+                    st.session_state.account = default_account()
                     st.session_state.account.update({"email":email.strip(),"registered":True,"logged_in":True})
                     if st.session_state.get("pending_referral_bonus"):
                         add_xp("referral","Einladungscode eingelöst")
                         st.session_state.pending_referral_bonus = False
-                    st.session_state.step=20; st.rerun()
+                    st.session_state.step = 100 if st.session_state.app_mode == "biete" else 20
+                    st.rerun()
             else: st.warning("Bitte E-Mail und Passwort eingeben.")
 
     elif st.session_state.auth_mode=="login":
@@ -1190,6 +1573,9 @@ elif st.session_state.step==1 and st.session_state.app_mode=="suche":
                     if err:
                         st.error(err)
                     else:
+                        # KRITISCH: alte User-Daten leeren, BEVOR neue geladen werden
+                        reset_user_data()
+                        st.session_state.account = default_account()
                         st.session_state.account.update({"email":email.strip(),"sb_user_id":user.id,"logged_in":True})
                         # Lade gespeichertes Profil aus Datenbank
                         saved = sb_load_profile(user.id)
@@ -1211,17 +1597,49 @@ elif st.session_state.step==1 and st.session_state.app_mode=="suche":
                             # Lade Nachrichten
                             msgs = sb_load_messages(user.id)
                             if msgs: st.session_state.nachrichten = msgs
-                            # Bekannter Nutzer → direkt zu Jobs
-                            st.session_state.matches = calculate_matches(st.session_state.profile)
-                            st.session_state.current_match_index = 0
-                            st.session_state.step = 13; st.rerun()
+                            # Lade eigene Job-Posts (falls Arbeitgeber)
+                            own_posts = sb_load_my_posted_jobs(user.id)
+                            if own_posts: st.session_state.posted_jobs = own_posts
+                            # Ziel-Step je nach Modus
+                            if st.session_state.app_mode == "biete":
+                                # Arbeitgeber: direkt ins Dashboard (oder zum Job-Einstellen wenn noch keine Posts)
+                                st.session_state.step = 107 if own_posts else 100
+                            else:
+                                # Bekannter Job-Sucher → direkt zu Jobs
+                                st.session_state.matches = calculate_matches(st.session_state.profile)
+                                st.session_state.current_match_index = 0
+                                st.session_state.step = 13
+                            st.rerun()
                         else:
-                            # Neues Profil anlegen
-                            st.session_state.step=20; st.rerun()
+                            # Neues Profil anlegen (oder neuer Arbeitgeber-Post)
+                            st.session_state.step = 100 if st.session_state.app_mode == "biete" else 20
+                            st.rerun()
                 else:
                     st.session_state.account.update({"email":email.strip(),"logged_in":True})
-                    st.session_state.step=20; st.rerun()
+                    st.session_state.step = 100 if st.session_state.app_mode == "biete" else 20
+                    st.rerun()
             else: st.warning("Bitte E-Mail und Passwort eingeben.")
+        # Passwort vergessen
+        st.write("")
+        st.markdown("<p style='font-size:12px;color:#475569;text-align:center;margin-bottom:6px;'>Passwort vergessen?</p>", unsafe_allow_html=True)
+        if "show_pw_reset" not in st.session_state:
+            st.session_state.show_pw_reset = False
+        if st.button("Reset-Link anfordern", key="pw_reset_toggle", use_container_width=True):
+            st.session_state.show_pw_reset = not st.session_state.show_pw_reset
+            st.rerun()
+        if st.session_state.get("show_pw_reset", False):
+            st.write("")
+            _pw_email = st.text_input("E-Mail für Reset", placeholder="Deine E-Mail-Adresse", key="pw_reset_email", label_visibility="collapsed")
+            if st.button("Senden", key="pw_reset_send_btn", use_container_width=True):
+                if _pw_email.strip():
+                    _ok, _err = sb_reset_password(_pw_email.strip())
+                    if _ok:
+                        st.success("Reset-Link gesendet — schau auch im Spam-Ordner.")
+                        st.session_state.show_pw_reset = False
+                    else:
+                        st.error(f"Fehler: {_err}")
+                else:
+                    st.warning("Bitte E-Mail eingeben.")
     st.divider()
     if st.button("Zurück zur Auswahl",use_container_width=True): reset_all()
 
@@ -1587,10 +2005,14 @@ elif st.session_state.step==10 and st.session_state.app_mode=="suche":
 elif st.session_state.step==11 and st.session_state.app_mode=="suche":
     _ps=profil_staerke(st.session_state.profile); st.progress(_ps/100); st.caption(f'Profilstärke: {_ps}%')
     H("Dein Mindestgehalt"); hint("Nur Jobs ab diesem Betrag werden angezeigt.")
-    if st.session_state.profile["jobart"] in ["Minijob","Werkstudent","Ferienjob"]:
+    if st.session_state.profile["jobart"] in ["Minijob","Werkstudent","Ferienjob","Schülerpraktikum"]:
         opts=[12,13,14,15,16,18,20,25]
         dv=st.session_state.profile["gehalt_min"] if st.session_state.profile["gehalt_min"] in opts else 14
         gehalt_min=st.select_slider("Gehalt",options=opts,value=dv,format_func=lambda x:f"{x} €/Stunde")
+    elif st.session_state.profile["jobart"] == "Ausbildung":
+        azubi_opts=[600,700,800,900,1000,1200,1500]
+        dv=st.session_state.profile["gehalt_min"] if st.session_state.profile["gehalt_min"] in azubi_opts else 800
+        gehalt_min=st.select_slider("Gehalt",options=azubi_opts,value=dv,format_func=lambda x:f"{x} €/Monat")
     else:
         monthly=[1200,1800,2500,3000,3500,4000,5000,6000,42000]
         dv=st.session_state.profile["gehalt_min"] if st.session_state.profile["gehalt_min"] in monthly else 2500
@@ -1756,7 +2178,7 @@ elif st.session_state.step==13 and st.session_state.app_mode=="suche":
                 if _days <= 2: _cd_html = "<span style='background:#ef444422;color:#ef4444;border:1px solid #ef444444;border-radius:999px;padding:3px 10px;font-size:11px;font-weight:700;'> Noch " + str(_days) + " Tag(e)!</span>"
                 elif _days <= 7: _cd_html = "<span style='background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b44;border-radius:999px;padding:3px 10px;font-size:11px;'> Noch " + str(_days) + " Tage</span>"
             _skills_html = "".join(["<span style='display:inline-block;background:rgba(34,211,238,0.08);border:1px solid rgba(34,211,238,0.28);border-radius:999px;padding:3px 9px;font-size:11px;color:#67e8f9;margin:2px;'>" + s + "</span>" for s in job.get("skills",[])])
-            _ben_html = "".join(["<span style='display:inline-block;background:#ffffff08;border:1px solid #222;border-radius:999px;padding:3px 9px;font-size:11px;color:#666;margin:2px;'>" + b + "</span>" for b in job.get("benefits",[])])
+            _ben_html = "".join(["<span style='display:inline-block;background:#ffffff0a;border:1px solid #2a3a4a;border-radius:999px;padding:3px 9px;font-size:11px;color:#cbd5e1;margin:2px;'>" + b + "</span>" for b in job.get("benefits",[])])
             _match_line = "".join(["<span style='font-size:11px;color:#4b5563;display:block;margin:2px 0;'>— " + r + "</span>" for _,r in job.get("reason_parts",[])])
             _card = (
                 "<div style='background:linear-gradient(145deg,#0a0a16,#08080f);border:1px solid #1e1e35;border-radius:20px;overflow:hidden;margin-bottom:8px;'>"
@@ -1784,19 +2206,24 @@ elif st.session_state.step==13 and st.session_state.app_mode=="suche":
                 + (_skills_html if _skills_html else "<span style='color:#2d3748;font-size:12px;'>Keine angegeben</span>") +
                 "</div>"
                 "<div style='padding:10px 18px 12px;'>"
-                "<div style='font-size:10px;color:#374151;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px;'>Benefits</div>"
+                "<div style='font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px;'>Benefits</div>"
                 + (_ben_html if _ben_html else "<span style='color:#2d3748;font-size:12px;'>Keine angegeben</span>")
                 + ("<div style='margin-top:8px;'>" + _cd_html + "</div>" if _cd_html else "")
                 + "</div></div>"
             )
             st.markdown(_card, unsafe_allow_html=True)
-            with st.expander(" Bewerbungsfrist setzen"):
+            _frist_key = f"frist_open_{idx}"
+            if _frist_key not in st.session_state: st.session_state[_frist_key] = False
+            if st.button("Bewerbungsfrist setzen", key=f"frist_toggle_{idx}", use_container_width=True):
+                st.session_state[_frist_key] = not st.session_state[_frist_key]
+            if st.session_state[_frist_key]:
                 _new_cd = st.date_input("Frist", min_value=date.today(), key="cd_" + str(idx))
                 if st.button("Frist speichern", key="cdsave_" + str(idx), use_container_width=True):
                     if "countdown_jobs" not in st.session_state: st.session_state.countdown_jobs = {}
-                    st.session_state.countdown_jobs[_cd_key] = _new_cd; st.rerun()
+                    st.session_state.countdown_jobs[_cd_key] = _new_cd
+                    st.session_state[_frist_key] = False
+                    st.rerun()
 
-            col1,col2,col3=st.columns(3)
             col1,col2,col3=st.columns(3)
             with col1:
                 if st.button("Weiter",key="dislike_btn",use_container_width=True): dislike_current_job()
@@ -1808,9 +2235,9 @@ elif st.session_state.step==13 and st.session_state.app_mode=="suche":
             # Ähnliche Jobs
             similar=find_similar_jobs(job,matches)
             if similar:
-                st.markdown("<p style='font-size:12px;color:#3a3a3a;margin-top:14px;margin-bottom:4px;'>Ähnliche Jobs:</p>",unsafe_allow_html=True)
+                st.markdown("<p style='font-size:12px;color:#64748b;margin-top:14px;margin-bottom:6px;font-weight:600;letter-spacing:0.04em;text-transform:uppercase;'>Ähnliche Jobs</p>",unsafe_allow_html=True)
                 for sj in similar:
-                    st.markdown(f"<p style='font-size:12px;color:#444;margin:2px 0;'>— {sj['title']} ({sj['score']}% Match)</p>",unsafe_allow_html=True)
+                    st.markdown(f"<p style='font-size:13px;color:#94a3b8;margin:4px 0;padding:6px 10px;background:#0a0a16;border:1px solid #1e1e35;border-radius:8px;'>— {sj['title']} <span style=\"color:#22d3ee;font-weight:700;\">{sj['score']}%</span></p>",unsafe_allow_html=True)
 
         else:
             st.success("Du hast alle passenden Jobs gesehen.")
@@ -1873,11 +2300,16 @@ elif st.session_state.step==15 and st.session_state.app_mode=="suche":
         with st.container(border=True):
             # Status-Badge oben
             STATUS_COLORS = {
-                "Gemerkt":"#444","Beworben":"#555","In Prüfung":"#666",
-                "Interview":"#888","Angebot":"#aaa","Angenommen":"#fff","Abgelehnt":"#444"
+                "Gemerkt":    ("#475569", "#1e293b", "#334155"),
+                "Beworben":   ("#22d3ee", "#0c2233", "#164e63"),
+                "In Prüfung": ("#a78bfa", "#1a1433", "#2e1d6b"),
+                "Interview":  ("#f59e0b", "#1f1500", "#451a00"),
+                "Angebot":    ("#34d399", "#0a2017", "#064e3b"),
+                "Angenommen": ("#fff",    "#0f1f0f", "#14532d"),
+                "Abgelehnt":  ("#ef4444", "#1f0a0a", "#450a0a"),
             }
-            sc=STATUS_COLORS.get(app["status"],"#555")
-            st.markdown(f"<span style='font-size:11px;background:#1a1a1a;border:1px solid #2a2a2a;border-radius:999px;padding:3px 10px;color:{sc};'>{app['status']}</span>",unsafe_allow_html=True)
+            _sc_txt, _sc_bg, _sc_brd = STATUS_COLORS.get(app["status"], ("#94a3b8","#1a1a1a","#2a2a2a"))
+            st.markdown(f"<span style='font-size:11px;background:{_sc_bg};border:1px solid {_sc_brd};border-radius:999px;padding:4px 12px;color:{_sc_txt};font-weight:700;letter-spacing:0.04em;'>{app['status']}</span>",unsafe_allow_html=True)
             st.write("")
             st.markdown(f"<p style='font-weight:600;color:#fff;margin:0 0 2px 0;font-size:16px;'>{app['title']}</p>",unsafe_allow_html=True)
             st.caption(f"{app['city']} · {app['job_type']} · {app['score']}% Match")
@@ -2015,6 +2447,17 @@ elif st.session_state.step==16 and st.session_state.app_mode=="suche":
                     if a["title"]==job["title"] and a["city"]==job["city"]:
                         update_application_status(i,"Beworben"); break
             st.session_state.step=17; st.rerun()
+        _anschr_url = (job.get("_apply_url","") or job.get("apply_url","")).strip()
+        if _anschr_url:
+            st.markdown(
+                f"<a href='{_anschr_url}' target='_blank' style='"
+                "display:block;text-align:center;"
+                "background:#0d1f2d;border:1.5px solid rgba(34,211,238,0.55);"
+                "color:#ffffff;font-weight:700;font-size:14px;padding:12px 20px;border-radius:10px;"
+                "text-decoration:none;margin-top:8px;letter-spacing:0.02em;'>"
+                "Direkt beim Arbeitgeber bewerben</a>",
+                unsafe_allow_html=True
+            )
     st.write("")
     col1,col2=st.columns(2)
     with col1:
@@ -2029,11 +2472,24 @@ elif st.session_state.step==17 and st.session_state.app_mode=="suche":
     job=st.session_state.anschreiben_job
     st.write("")
     with st.container(border=True):
-        st.markdown("<p style='font-size:22px;font-weight:700;color:#fff;text-align:center;margin:12px 0 6px 0;'>Bewerbung abgeschickt</p>",unsafe_allow_html=True)
-        st.markdown(f"<p style='font-size:14px;color:#888;text-align:center;margin-bottom:16px;'>{job['title']} · {job['city']}</p>",unsafe_allow_html=True)
-        st.markdown("<p style='font-size:14px;color:#ccc;text-align:center;line-height:1.6;'>Deine Bewerbung ist jetzt im Tracker sichtbar. Sobald du ein Interview bekommst, generiert die App deine Interviewfragen.</p>",unsafe_allow_html=True)
+        st.markdown("<p style='font-size:20px;font-weight:700;color:#22d3ee;text-align:center;margin:12px 0 4px 0;'>Im Tracker gespeichert</p>",unsafe_allow_html=True)
+        st.markdown(f"<p style='font-size:14px;color:#888;text-align:center;margin-bottom:10px;'>{job['title']} · {job['city']}</p>",unsafe_allow_html=True)
+        st.markdown("<p style='font-size:13px;color:#94a3b8;text-align:center;line-height:1.6;margin-bottom:10px;'>Dieser Job ist jetzt in deinem Bewerbungs-Tracker. Du hast dich noch <strong style='color:#fff;'>nicht offiziell beworben</strong> — klicke unten, um die Bewerbung direkt beim Arbeitgeber abzuschicken.</p>",unsafe_allow_html=True)
         st.divider()
-        st.markdown("<p style='font-size:13px;color:#555;text-align:center;margin:4px 0 10px 0;'>Was als nächstes?</p>",unsafe_allow_html=True)
+        _apply_url = (job.get("_apply_url","") or job.get("apply_url","")).strip()
+        if _apply_url:
+            st.markdown(
+                f"<a href='{_apply_url}' target='_blank' style='"
+                "display:block;text-align:center;"
+                "background:#0d1f2d;border:1.5px solid rgba(34,211,238,0.55);"
+                "color:#ffffff;font-weight:700;font-size:15px;padding:13px 20px;border-radius:10px;"
+                "text-decoration:none;margin:8px 0 4px 0;letter-spacing:0.02em;'>"
+                "Jetzt beim Arbeitgeber bewerben</a>",
+                unsafe_allow_html=True
+            )
+            st.markdown("<p style='font-size:11px;color:#475569;text-align:center;margin:0 0 8px 0;'>Öffnet die Stellenanzeige in einem neuen Tab.</p>",unsafe_allow_html=True)
+        else:
+            st.markdown("<p style='font-size:13px;color:#555;text-align:center;margin:8px 0;'>Bewirb dich direkt auf der Karriereseite des Unternehmens.</p>",unsafe_allow_html=True)
     st.write("")
     key=f"anschreiben_{job['title']}"
     has_anschreiben=key in st.session_state and st.session_state[key]
@@ -2130,7 +2586,9 @@ elif st.session_state.step==19 and st.session_state.app_mode=="suche":
     st.divider()
 
     # Neue Nachricht senden
-    neue_nachricht = st.text_input("Nachricht schreiben", placeholder="z.B. Ich wollte kurz nachfragen...", label_visibility="collapsed")
+    if "chat_input_val" not in st.session_state:
+        st.session_state.chat_input_val = ""
+    neue_nachricht = st.text_input("Nachricht schreiben", placeholder="z.B. Ich wollte kurz nachfragen...", label_visibility="collapsed", key="chat_msg_input", value=st.session_state.chat_input_val)
     col1, col2 = st.columns([3,1])
     with col1:
         pass
@@ -2144,6 +2602,10 @@ elif st.session_state.step==19 and st.session_state.app_mode=="suche":
                     "text": neue_nachricht.strip(),
                     "time": str(date.today())
                 })
+                # Supabase speichern
+                uid = st.session_state.account.get("sb_user_id")
+                if uid:
+                    sb_save_message(uid, app_key, "Bewerber", neue_nachricht.strip())
                 # Simuliere Arbeitgeber-Antwort auf Follow-up
                 import random
                 antworten = [
@@ -2156,15 +2618,217 @@ elif st.session_state.step==19 and st.session_state.app_mode=="suche":
                     "text": random.choice(antworten),
                     "time": str(date.today())
                 })
+                # Input leeren
+                st.session_state.chat_input_val = ""
                 st.rerun()
 
     st.write("")
     if st.button("Zurück zu Bewerbungen", use_container_width=True):
         st.session_state.step=15; st.rerun()
 
-# 
+#
+# STEP 21 — Meine Stats
+#
+elif st.session_state.step==21 and st.session_state.app_mode=="suche":
+    H("Meine Stats")
+    apps = st.session_state.applications
+    _today = date.today()
+    _week_ago = str(_today - timedelta(days=7))
+    _total_gemerkt = len(apps)
+    _total_beworben = len([a for a in apps if a["status"] != "Gemerkt"])
+    _week_apps = len([a for a in apps if a.get("applied_at","") >= _week_ago and a["status"] != "Gemerkt"])
+    _avg_score = int(sum(a["score"] for a in apps) / len(apps)) if apps else 0
+    _responses = len([a for a in apps if a["status"] in ["In Prüfung","Interview","Angebot","Angenommen"]])
+    _response_rate = int(_responses / _total_beworben * 100) if _total_beworben > 0 else 0
+    _interviews = len([a for a in apps if a["status"] in ["Interview","Angebot"]])
+    _angebote = len([a for a in apps if a["status"] == "Angenommen"])
+    _jt_count = {}
+    for a in apps:
+        jt = a.get("job_type","Sonstige")
+        _jt_count[jt] = _jt_count.get(jt,0)+1
+    _fav_type = max(_jt_count, key=_jt_count.get) if _jt_count else "—"
+    _xp_val = st.session_state.get("xp",0)
+    _streak_val = st.session_state.get("streak_count",0)
+
+    st.markdown("""<style>
+@keyframes statIn{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
+.sc1{animation:statIn .45s ease both}
+.sc2{animation:statIn .45s .1s ease both}
+.sc3{animation:statIn .45s .2s ease both}
+.sc4{animation:statIn .45s .3s ease both}
+.sc5{animation:statIn .45s .4s ease both}
+.sc6{animation:statIn .45s .5s ease both}
+</style>""", unsafe_allow_html=True)
+
+    # Highlight: Diese Woche
+    st.markdown(
+        f"<div class='sc1' style='background:linear-gradient(135deg,rgba(34,211,238,0.13),rgba(6,182,212,0.06));border:1px solid rgba(34,211,238,0.3);border-radius:16px;padding:22px;text-align:center;margin-bottom:12px;'>"
+        f"<div style='font-size:10px;color:#64748b;text-transform:uppercase;letter-spacing:.12em;margin-bottom:8px;'>Diese Woche</div>"
+        f"<div style='font-size:56px;font-weight:900;background:linear-gradient(135deg,#a5f3fc,#22d3ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;'>{_week_apps}</div>"
+        f"<div style='font-size:13px;color:#94a3b8;margin-top:8px;'>Bewerbungen abgeschickt</div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    # Stats-Grid 2x2
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        st.markdown(f"<div class='sc2' style='background:#0a0d14;border:1px solid #1e293b;border-radius:14px;padding:16px;text-align:center;margin-bottom:10px;'><div style='font-size:32px;font-weight:900;color:#a78bfa;'>{_total_beworben}</div><div style='font-size:11px;color:#475569;margin-top:4px;'>Gesamt beworben</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sc4' style='background:#0a0d14;border:1px solid #1e293b;border-radius:14px;padding:16px;text-align:center;margin-bottom:10px;'><div style='font-size:32px;font-weight:900;color:#34d399;'>{_response_rate}%</div><div style='font-size:11px;color:#475569;margin-top:4px;'>Rücklaufquote</div></div>", unsafe_allow_html=True)
+    with _c2:
+        st.markdown(f"<div class='sc3' style='background:#0a0d14;border:1px solid #1e293b;border-radius:14px;padding:16px;text-align:center;margin-bottom:10px;'><div style='font-size:32px;font-weight:900;color:#f59e0b;'>{_avg_score}%</div><div style='font-size:11px;color:#475569;margin-top:4px;'>Ø Match-Score</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='sc5' style='background:#0a0d14;border:1px solid #1e293b;border-radius:14px;padding:16px;text-align:center;margin-bottom:10px;'><div style='font-size:32px;font-weight:900;color:#22d3ee;'>{_interviews}</div><div style='font-size:11px;color:#475569;margin-top:4px;'>Interviews erhalten</div></div>", unsafe_allow_html=True)
+
+    # Untere Zeile: XP · Streak · Jobtyp
+    st.markdown(
+        f"<div class='sc6' style='background:#0a0d14;border:1px solid #1e293b;border-radius:14px;padding:14px 16px;display:flex;justify-content:space-around;margin-bottom:10px;'>"
+        f"<div style='text-align:center;'><div style='font-size:22px;font-weight:800;color:#f472b6;'>{_xp_val}</div><div style='font-size:10px;color:#475569;margin-top:2px;'>Gesamt XP</div></div>"
+        f"<div style='width:1px;background:#1e293b;'></div>"
+        f"<div style='text-align:center;'><div style='font-size:22px;font-weight:800;color:#f97316;'>{_streak_val}🔥</div><div style='font-size:10px;color:#475569;margin-top:2px;'>Tage Streak</div></div>"
+        f"<div style='width:1px;background:#1e293b;'></div>"
+        f"<div style='text-align:center;'><div style='font-size:14px;font-weight:700;color:#67e8f9;margin-top:4px;'>{_fav_type}</div><div style='font-size:10px;color:#475569;margin-top:2px;'>Meist beworben</div></div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    if _angebote > 0:
+        st.markdown(
+            f"<div style='background:linear-gradient(135deg,rgba(52,211,153,0.15),rgba(16,185,129,0.07));border:1px solid rgba(52,211,153,0.35);border-radius:14px;padding:16px;text-align:center;'>"
+            f"<div style='font-size:20px;font-weight:800;color:#34d399;'>🎉 {_angebote} Angebot{'e' if _angebote>1 else ''} angenommen!</div>"
+            f"<div style='font-size:12px;color:#94a3b8;margin-top:4px;'>Respekt — du rockst die Jobsuche!</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+    elif _total_beworben == 0:
+        st.info("Noch keine Bewerbungen — los geht's! Jeden Tag eine Bewerbung reicht.")
+
+    st.write("")
+    if st.button("← Zurück zu Jobs", use_container_width=True, key="stats_back"):
+        st.session_state.step=13; st.rerun()
+
+#
+# STEP 22 — Freundesgruppe
+#
+elif st.session_state.step==22 and st.session_state.app_mode=="suche":
+    H("Freundesgruppe")
+    _uid22 = st.session_state.account.get("sb_user_id")
+    _vn22 = st.session_state.profile.get("vorname","Du")
+    _xp22 = st.session_state.get("xp",0)
+    _apc22 = len([a for a in st.session_state.applications if a["status"] != "Gemerkt"])
+
+    # Gruppe aus Supabase laden falls noch nicht in session
+    _grp22 = st.session_state.get("group_info")
+    if not _grp22 and _uid22 and sb_available():
+        _grp22 = sb_get_user_group(_uid22)
+        if _grp22:
+            st.session_state.group_info = _grp22
+            st.session_state.group_members = sb_get_group_leaderboard(_grp22["id"])
+
+    if _grp22:
+        # Mitgliedsdaten aktualisieren
+        if _uid22 and sb_available():
+            sb_update_group_member(_uid22, _grp22["id"], _xp22, _apc22)
+            st.session_state.group_members = sb_get_group_leaderboard(_grp22["id"])
+
+        st.markdown(
+            f"<div style='background:linear-gradient(135deg,rgba(167,139,250,0.12),rgba(99,102,241,0.06));border:1px solid rgba(167,139,250,0.28);border-radius:16px;padding:18px;text-align:center;margin-bottom:16px;'>"
+            f"<div style='font-size:20px;font-weight:800;color:#fff;margin-bottom:6px;'>{_grp22['name']}</div>"
+            f"<div style='font-size:12px;color:#64748b;'>Einladungscode</div>"
+            f"<div style='font-size:26px;font-weight:900;color:#a78bfa;letter-spacing:.2em;margin:6px 0;'>{_grp22['invite_code']}</div>"
+            f"<div style='font-size:11px;color:#475569;'>Teile diesen Code mit Freunden — sie treten deiner Gruppe bei</div>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+        _members22 = st.session_state.get("group_members",[])
+        if _members22:
+            st.markdown("<p style='font-size:13px;font-weight:700;color:#a78bfa;margin-bottom:8px;'>🏆 Leaderboard</p>", unsafe_allow_html=True)
+            _medals = ["🥇","🥈","🥉"]
+            for _ri, _m in enumerate(_members22):
+                _is_me = _m.get("user_id") == _uid22
+                _medal = _medals[_ri] if _ri < 3 else f"#{_ri+1}"
+                _bg = "rgba(167,139,250,0.09)" if _is_me else "#0a0d14"
+                _brd = "rgba(167,139,250,0.3)" if _is_me else "#1e293b"
+                _me_tag = " <span style='font-size:10px;color:#a78bfa;'>(du)</span>" if _is_me else ""
+                st.markdown(
+                    f"<div style='background:{_bg};border:1px solid {_brd};border-radius:12px;padding:12px 16px;margin-bottom:7px;display:flex;align-items:center;justify-content:space-between;'>"
+                    f"<div style='display:flex;align-items:center;gap:12px;'>"
+                    f"<span style='font-size:20px;'>{_medal}</span>"
+                    f"<div><div style='font-size:14px;font-weight:600;color:#fff;'>{_m.get('display_name','Anonym')}{_me_tag}</div>"
+                    f"<div style='font-size:11px;color:#475569;'>{_m.get('applications_count',0)} Bewerbungen</div></div></div>"
+                    f"<div style='font-size:16px;font-weight:800;color:#a5f3fc;'>{_m.get('xp',0)} XP</div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+        st.write("")
+        st.markdown("<p style='font-size:12px;color:#334155;text-align:center;'>+80 XP für dich, wenn ein Freund mit deinem Code beitritt!</p>", unsafe_allow_html=True)
+
+    else:
+        # Noch in keiner Gruppe
+        if "grp_mode" not in st.session_state: st.session_state.grp_mode = "choose"
+
+        if st.session_state.grp_mode == "choose":
+            st.markdown(
+                "<div style='text-align:center;padding:20px 0 10px 0;'>"
+                "<div style='font-size:40px;margin-bottom:12px;'>👥</div>"
+                "<p style='font-size:14px;color:#94a3b8;line-height:1.6;margin-bottom:20px;'>Miss dich mit Freunden — wer sammelt am meisten XP und landet als Erster einen Job?</p>"
+                "</div>",
+                unsafe_allow_html=True
+            )
+            _gc1, _gc2 = st.columns(2)
+            with _gc1:
+                if st.button("Gruppe erstellen", use_container_width=True, key="grp_create_btn"):
+                    st.session_state.grp_mode = "create"; st.rerun()
+            with _gc2:
+                if st.button("Code eingeben", use_container_width=True, key="grp_join_btn"):
+                    st.session_state.grp_mode = "join"; st.rerun()
+
+        elif st.session_state.grp_mode == "create":
+            st.markdown("<p style='font-size:13px;color:#94a3b8;margin-bottom:8px;'>Gib deiner Gruppe einen Namen — ein Code wird automatisch generiert.</p>", unsafe_allow_html=True)
+            _gname = st.text_input("Gruppenname", placeholder="z.B. WG-Jobsuche 2025", key="grp_name_input")
+            if st.button("Gruppe starten", use_container_width=True, key="grp_start_btn"):
+                if _gname.strip() and _uid22:
+                    _grp_new, _err = sb_create_group(_uid22, _gname.strip(), _vn22, _xp22)
+                    if _grp_new:
+                        st.session_state.group_info = _grp_new
+                        st.session_state.group_members = sb_get_group_leaderboard(_grp_new["id"])
+                        st.session_state.grp_mode = "choose"
+                        st.toast(f"Gruppe '{_gname}' erstellt! Code: {_grp_new['invite_code']}", icon="🎉")
+                        st.rerun()
+                    else:
+                        st.error(_err or "Fehler beim Erstellen")
+                elif not _uid22:
+                    st.warning("Bitte erst einloggen.")
+            if st.button("Abbrechen", key="grp_cancel_create", use_container_width=True):
+                st.session_state.grp_mode = "choose"; st.rerun()
+
+        elif st.session_state.grp_mode == "join":
+            st.markdown("<p style='font-size:13px;color:#94a3b8;margin-bottom:8px;'>Gib den 6-stelligen Code ein, den du von einem Freund bekommen hast.</p>", unsafe_allow_html=True)
+            _jcode = st.text_input("Einladungscode", placeholder="z.B. ABC123", max_chars=6, key="grp_code_input")
+            if st.button("Beitreten", use_container_width=True, key="grp_join_confirm"):
+                if _jcode.strip() and _uid22:
+                    _grp_j, _err_j = sb_join_group(_uid22, _jcode.strip(), _vn22, _xp22)
+                    if _grp_j:
+                        st.session_state.group_info = _grp_j
+                        st.session_state.group_members = sb_get_group_leaderboard(_grp_j["id"])
+                        add_xp("referral", _vn22 + " ist einer Gruppe beigetreten")
+                        st.session_state.grp_mode = "choose"
+                        st.toast("🎉 Gruppe beigetreten! +80 XP", icon="⚡")
+                        st.rerun()
+                    else:
+                        st.error(_err_j or "Ungültiger Code")
+                elif not _uid22:
+                    st.warning("Bitte erst einloggen.")
+            if st.button("Abbrechen", key="grp_cancel_join", use_container_width=True):
+                st.session_state.grp_mode = "choose"; st.rerun()
+
+    st.write("")
+    if st.button("← Zurück zu Jobs", use_container_width=True, key="grp_back_main"):
+        st.session_state.step=13; st.rerun()
+
+#
 # ARBEITGEBER 100–107
-# 
+#
 elif st.session_state.step==100 and st.session_state.app_mode=="biete":
     H("Job einstellen"); hint("Grunddaten der Stelle — so erscheint sie auf der Jobkarte.")
     title=st.text_input("Jobtitel",value=st.session_state.job_post_form["title"],placeholder="z.B. Junior Marketing Manager")
@@ -2276,12 +2940,24 @@ elif st.session_state.step==107 and st.session_state.app_mode=="biete":
 
     def delete_posted_job(idx):
         if 0 <= idx < len(st.session_state.posted_jobs):
+            _job = st.session_state.posted_jobs[idx]
+            _db_id = _job.get("_db_id")
+            if _db_id and sb_available():
+                sb_delete_posted_job(_db_id)
             st.session_state.posted_jobs.pop(idx)
+            try: _cached_all_active_posts.clear()
+            except Exception: pass
             st.rerun()
 
     def set_job_status(idx, status):
         if 0 <= idx < len(st.session_state.posted_jobs):
+            _job = st.session_state.posted_jobs[idx]
+            _db_id = _job.get("_db_id")
+            if _db_id and sb_available():
+                sb_update_posted_job_status(_db_id, status)
             st.session_state.posted_jobs[idx]["job_status"] = status
+            try: _cached_all_active_posts.clear()
+            except Exception: pass
             st.rerun()
 
     def update_bewerber_status(job_title, bewerber_idx, new_status):
@@ -2360,7 +3036,12 @@ elif st.session_state.step==107 and st.session_state.app_mode=="biete":
                         label_visibility="collapsed"
                     )
                     if new_js != js:
+                        _db_id_inline = st.session_state.posted_jobs[i].get("_db_id")
+                        if _db_id_inline and sb_available():
+                            sb_update_posted_job_status(_db_id_inline, new_js)
                         st.session_state.posted_jobs[i]["job_status"] = new_js
+                        try: _cached_all_active_posts.clear()
+                        except Exception: pass
                         st.rerun()
 
                     # Aktionen
@@ -2405,8 +3086,13 @@ elif st.session_state.step==107 and st.session_state.app_mode=="biete":
 
                 for bidx, (app_idx, app) in enumerate(job_bewerber):
                     STATUS_COLORS = {
-                        "Beworben":"#666","In Prüfung":"#888","Interview":"#aaa",
-                        "Angebot":"#ccc","Angenommen":"#fff","Abgelehnt":"#444","Gemerkt":"#555"
+                        "Gemerkt":    ("#475569", "#1e293b", "#334155"),
+                        "Beworben":   ("#22d3ee", "#0c2233", "#164e63"),
+                        "In Prüfung": ("#a78bfa", "#1a1433", "#2e1d6b"),
+                        "Interview":  ("#f59e0b", "#1f1500", "#451a00"),
+                        "Angebot":    ("#34d399", "#0a2017", "#064e3b"),
+                        "Angenommen": ("#fff",    "#0f1f0f", "#14532d"),
+                        "Abgelehnt":  ("#ef4444", "#1f0a0a", "#450a0a"),
                     }
                     sc = STATUS_COLORS.get(app["status"],"#666")
                     _is_boosted_app = bool(app.get("_boosted_at"))
